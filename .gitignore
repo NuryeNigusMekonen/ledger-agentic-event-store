@@ -1,0 +1,24 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+challenge/
+
+# Local project PostgreSQL instance (data, socket, logs)
+.local/postgres/
+
+# Generated artifacts
+tmp/
+*.log
+apps/web/node_modules/
+apps/web/dist/
+apps/web/.vite/
+apps/web/.env
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
