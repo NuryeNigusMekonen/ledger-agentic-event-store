@@ -27,6 +27,171 @@ All code phases are implemented:
 Current integration validation:
 - `14 passed` (full suite with database running)
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+  U[User or Dashboard] --> API[FastAPI API]
+
+  API --> AUTH[JWT auth RBAC auth audit log]
+  AUTH --> CMD[Command endpoints]
+  AUTH --> QRY[Query endpoints]
+
+  CMD --> MCPW[Ledger MCP write side]
+  QRY --> MCPR[Ledger MCP read side]
+
+  subgraph COMMAND_SIDE[Command side MCP tools]
+    T1[submit application]
+    T2[start agent session]
+    T3[record credit analysis]
+    T4[record fraud screening]
+    T5[record compliance check]
+    T6[generate decision]
+    T7[record human review]
+    T8[run integrity check]
+  end
+
+  MCPW --> T1
+  MCPW --> T2
+  MCPW --> T3
+  MCPW --> T4
+  MCPW --> T5
+  MCPW --> T6
+  MCPW --> T7
+  MCPW --> T8
+
+  T1 --> V1[Tool validation]
+  T2 --> V2[Tool validation]
+  T3 --> V3[Tool validation]
+  T4 --> V4[Tool validation]
+  T5 --> V5[Tool validation]
+  T6 --> V6[Tool validation]
+  T7 --> V7[Tool validation]
+  T8 --> V8[Tool validation]
+
+  V1 --> H1[Write handler load validate decide]
+  V2 --> H2[Write handler load validate decide]
+  V3 --> H3[Write handler load validate decide]
+  V4 --> H4[Write handler load validate decide]
+  V5 --> H5[Write handler load validate decide]
+  V6 --> H6[Write handler load validate decide]
+  V7 --> H7[Write handler load validate decide]
+  V8 --> H8[Write handler load validate decide]
+
+  H1 --> AGG1[Replay aggregates before write]
+  H2 --> AGG2[Replay aggregates before write]
+  H3 --> AGG3[Replay aggregates before write]
+  H4 --> AGG4[Replay aggregates before write]
+  H5 --> AGG5[Replay aggregates before write]
+  H6 --> AGG6[Replay aggregates before write]
+  H7 --> AGG7[Replay aggregates before write]
+  H8 --> AGG8[Replay aggregates before write]
+
+  AGG1 --> DOCFLAG{Process documents after submit}
+  AGG2 --> S1[Append AgentContextLoaded]
+  AGG3 --> C1[Append CreditAnalysisCompleted]
+  AGG4 --> F1[Append FraudScreeningCompleted]
+  AGG5 --> CO1[Append ComplianceCheckRequested]
+  AGG5 --> CO2[Append ComplianceRulePassed or ComplianceRuleFailed]
+  AGG6 --> G1[Append DecisionGenerated]
+  AGG7 --> HR1[Append HumanReviewCompleted]
+  AGG7 --> HR2[Append ApplicationApproved or ApplicationDeclined]
+  AGG8 --> I1[Append AuditIntegrityCheckRun]
+
+  DOCFLAG -- No --> E1[Append ApplicationSubmitted]
+  E1 --> E2[Append CreditAnalysisRequested]
+
+  DOCFLAG -- Yes --> E3[Append ApplicationSubmitted]
+  E3 --> REFINERY[Start Week3 refinery]
+
+  subgraph WEEK3[Week3 refinery integration]
+    REFINERY --> TRIAGE[Triage profile document]
+    TRIAGE --> ROUTER[Select extraction strategy]
+    ROUTER --> FAST[Fast text extraction]
+    ROUTER --> LAYOUT[Layout aware extraction]
+    ROUTER --> VISION[Vision augmented extraction]
+    ROUTER --> XLEDGER[Write extraction ledger]
+    FAST --> CHUNK[Chunk document]
+    LAYOUT --> CHUNK
+    VISION --> CHUNK
+    CHUNK --> INDEX[Build page index]
+    CHUNK --> FACTS[Extract financial facts]
+    INDEX --> PAGEIDX[Write page index json]
+    FACTS --> FACTDB[Write fact table sqlite]
+  end
+
+  PAGEIDX --> D1[Append ExtractionCompleted]
+  FACTDB --> D1
+  D1 --> D2[Append QualityAssessmentCompleted]
+  D2 --> D3[Append PackageReadyForAnalysis]
+  D3 --> E4[Append CreditAnalysisRequested from package ready]
+
+  subgraph STORE_AREA[Ledger core]
+    STORE[(Postgres event store)]
+    OCC[Optimistic concurrency expected version]
+    META[Correlation causation actor metadata]
+    UPCAST[Upcaster registry on reads]
+    INTEGRITY[Integrity hash chain]
+    OUTBOX[Outbox schema optional not wired in main flow]
+  end
+
+  E2 --> STORE
+  E3 --> STORE
+  E4 --> STORE
+  S1 --> STORE
+  C1 --> STORE
+  F1 --> STORE
+  CO1 --> STORE
+  CO2 --> STORE
+  G1 --> STORE
+  HR1 --> STORE
+  HR2 --> STORE
+  I1 --> STORE
+
+  STORE --> OCC
+  STORE --> META
+  STORE --> UPCAST
+  STORE --> INTEGRITY
+  STORE --> OUTBOX
+
+  STORE --> DAEMON[Projection daemon]
+  DAEMON --> CHECKPOINTS[Projection checkpoints lag rebuild]
+  DAEMON --> P1[Application summary projection]
+  DAEMON --> P2[Compliance audit view projection]
+  DAEMON --> P3[Agent performance projection]
+  DAEMON --> LAGS[Ledger health lag state]
+
+  subgraph QUERY_SIDE[Query side MCP resources]
+    R1[applications by id]
+    R2[applications compliance]
+    R3[applications audit trail]
+    R4[agents performance]
+    R5[agents session replay]
+    R6[ledger health]
+  end
+
+  MCPR --> R1
+  MCPR --> R2
+  MCPR --> R3
+  MCPR --> R4
+  MCPR --> R5
+  MCPR --> R6
+
+  R1 --> P1
+  R2 --> P2
+  R4 --> P3
+  R6 --> LAGS
+  R3 --> AUDITSTREAM[Direct audit stream load justified exception]
+  R5 --> SESSIONSTREAM[Direct agent session load justified exception]
+  AUDITSTREAM --> STORE
+  SESSIONSTREAM --> STORE
+
+  STORE --> WHATIF[What if projector]
+  STORE --> REGPKG[Regulatory package generator]
+  WHATIF --> WHATIFOUT[Counterfactual outcome comparison]
+  REGPKG --> REGJSON[Self contained regulatory json package]
+```
+
 ## Tech Stack
 
 - Python 3.11+
@@ -68,6 +233,63 @@ tests/
   test_regulatory_package.py
 migrations/
 scripts/
+```
+
+## Week 3 Refinery Integration
+
+This repo now includes a full local **Document Intelligence Refinery** pipeline under `src/refinery/`:
+
+- Triage agent (`DocumentProfile` generation)
+- Multi-strategy extraction (`fast_text`, `layout_aware`, `vision_augmented`) with confidence-gated escalation
+- Strategy B (`layout_aware`) uses Docling when available, with local fallback when Docling is not installed
+- Extraction ledger output at `.refinery/extraction_ledger.jsonl`
+- Semantic chunking and chunk validation rules
+- PageIndex generation at `.refinery/pageindex/{document_id}.json`
+- Structured financial fact extraction into SQLite (`.refinery/facts.db`)
+- Query interface methods: `pageindex_navigate`, `semantic_search`, `structured_query`
+
+Run refinery on a document:
+
+```bash
+python scripts/run_refinery.py /path/to/document.pdf
+```
+
+Enable Gemini-backed vision calibration (optional):
+
+```bash
+GEMINI_API_KEY=your_key_here python scripts/run_refinery.py /path/to/document.pdf
+```
+
+or:
+
+```bash
+python scripts/run_refinery.py /path/to/document.pdf --gemini-api-key your_key_here --gemini-model gemini-2.0-flash
+```
+
+When `GEMINI_API_KEY` is not set (or if Gemini is unreachable), the pipeline falls back to deterministic local extraction.
+
+Week 5 integration entry point (compatible with support doc import style):
+
+```python
+from document_refinery.pipeline import extract_financial_facts
+
+facts = extract_financial_facts("/path/to/document.pdf")
+```
+
+MCP/API integration:
+
+- `submit_application` accepts optional fields:
+- `document_path` (local file path)
+- `process_documents_after_submit` (`true`/`false`)
+- When enabled, submit flow will:
+- run refinery extraction
+- append `docpkg-{application_id}` events (`ExtractionCompleted`, `QualityAssessmentCompleted`, `PackageReadyForAnalysis`)
+- append `CreditAnalysisRequested` on `loan-{application_id}` after package readiness
+
+Configurable thresholds live in:
+
+```text
+rubric/extraction_rules.yaml
 ```
 
 ## Prerequisites
@@ -180,6 +402,8 @@ API_PORT=8000
 API_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://0.0.0.0:5173,http://[::1]:5173
 API_APPLY_SCHEMA_ON_START=true
 # LEDGER_API_KEY=optional-api-key
+GEMINI_API_KEY=optional-gemini-key
+GEMINI_MODEL=gemini-2.0-flash
 JWT_SECRET=replace-with-long-random-secret
 JWT_ISSUER=ledger-api
 JWT_TTL_MINUTES=120
