@@ -32,6 +32,8 @@ class SubmitApplicationInput(BaseModel):
     loan_purpose: str
     submission_channel: str
     submitted_at: datetime
+    document_path: str | None = None
+    process_documents_after_submit: bool = False
     correlation_id: str | None = None
 
 
@@ -145,7 +147,10 @@ class LedgerMCPTools:
                 "name": "submit_application",
                 "description": (
                     "Create ApplicationSubmitted event. Precondition: application_id must not "
-                    "already exist; duplicate IDs return PreconditionFailed."
+                    "already exist; duplicate IDs return PreconditionFailed. Optional: provide "
+                    "document_path + process_documents_after_submit=true to run refinery "
+                    "extraction, append docpkg lifecycle events, and then trigger "
+                    "CreditAnalysisRequested."
                 ),
                 "input_schema": SubmitApplicationInput.model_json_schema(),
             },
@@ -278,6 +283,8 @@ class LedgerMCPTools:
                 loan_purpose=params.loan_purpose,
                 submission_channel=params.submission_channel,
                 submitted_at=params.submitted_at,
+                document_path=params.document_path,
+                process_documents_after_submit=params.process_documents_after_submit,
                 correlation_id=params.correlation_id,
             )
         )
@@ -585,4 +592,3 @@ def _error(
     if details is not None:
         error["details"] = details
     return {"ok": False, "error": error}
-

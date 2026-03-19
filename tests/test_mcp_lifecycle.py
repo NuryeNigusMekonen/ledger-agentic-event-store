@@ -225,3 +225,51 @@ async def test_mcp_returns_structured_precondition_error(server: LedgerMCPServer
     assert result["error"]["error_type"] == "PreconditionFailed"
     assert "suggested_action" in result["error"]
 
+
+@pytest.mark.asyncio
+async def test_submit_application_can_process_document_and_emit_docpkg_events(
+    server: LedgerMCPServer,
+    tmp_path: Path,
+) -> None:
+    app_id = f"app-{uuid4()}"
+    document_path = tmp_path / "application_financials.txt"
+    document_path.write_text(
+        (
+            "Total Revenue: 1250000\n"
+            "Net Income: 210000\n"
+            "EBITDA: 320000\n"
+            "Total Assets: 4500000\n"
+            "Total Liabilities: 1700000\n"
+        ),
+        encoding="utf-8",
+    )
+
+    submit_result = await server.call_tool(
+        "submit_application",
+        {
+            "application_id": app_id,
+            "applicant_id": "customer-xyz",
+            "requested_amount_usd": 12000,
+            "loan_purpose": "fleet purchase",
+            "submission_channel": "portal",
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "document_path": str(document_path),
+            "process_documents_after_submit": True,
+        },
+    )
+    assert submit_result["ok"] is True
+
+    doc_events = await server.store.load_stream(f"docpkg-{app_id}")
+    doc_event_types = [event.event_type for event in doc_events]
+    assert "ExtractionCompleted" in doc_event_types
+    assert "QualityAssessmentCompleted" in doc_event_types
+    assert "PackageReadyForAnalysis" in doc_event_types
+
+    extraction_event = next(
+        event for event in doc_events if event.event_type == "ExtractionCompleted"
+    )
+    assert extraction_event.payload["facts"]["total_revenue"] == 1250000.0
+    assert extraction_event.payload["facts"]["net_income"] == 210000.0
+
+    loan_events = await server.store.load_stream(f"loan-{app_id}")
+    assert any(event.event_type == "CreditAnalysisRequested" for event in loan_events)

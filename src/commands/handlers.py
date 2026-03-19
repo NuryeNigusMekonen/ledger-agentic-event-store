@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 from src.aggregates.agent_session import AgentSessionAggregate
@@ -10,6 +11,7 @@ from src.aggregates.compliance_record import ComplianceRecordAggregate
 from src.aggregates.loan_application import LoanApplicationAggregate, LoanStatus
 from src.event_store import EventStore
 from src.models.events import AppendResult, BaseEvent, DomainError, StoredEvent
+from src.refinery.pipeline import extract_financial_facts
 
 
 @dataclass(slots=True)
@@ -20,6 +22,8 @@ class SubmitApplicationCommand:
     loan_purpose: str
     submission_channel: str
     submitted_at: datetime
+    document_path: str | None = None
+    process_documents_after_submit: bool = False
     correlation_id: str | None = None
 
 
@@ -127,10 +131,20 @@ class WriteCommandHandlers:
             raise DomainError(f"Application '{command.application_id}' already exists.")
         if command.requested_amount_usd <= 0:
             raise DomainError("requested_amount_usd must be positive.")
+        if command.process_documents_after_submit and not command.document_path:
+            raise DomainError(
+                "process_documents_after_submit requires document_path."
+            )
+        if command.document_path:
+            doc_path = Path(command.document_path)
+            if not doc_path.exists():
+                raise DomainError(f"document_path does not exist: {command.document_path}")
+            if not doc_path.is_file():
+                raise DomainError(f"document_path is not a file: {command.document_path}")
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
-        decided_events = [
+        decided_events: list[BaseEvent] = [
             BaseEvent(
                 event_type="ApplicationSubmitted",
                 payload={
@@ -142,29 +156,209 @@ class WriteCommandHandlers:
                     "submitted_at": command.submitted_at.isoformat(),
                 },
                 metadata=_metadata(correlation_id, actor_id=command.applicant_id),
-            ),
-            BaseEvent(
-                event_type="CreditAnalysisRequested",
-                payload={
-                    "application_id": command.application_id,
-                    "assigned_agent_id": "credit-analysis-router",
-                    "requested_at": datetime.now(UTC).isoformat(),
-                    "priority": "normal",
-                },
-                metadata=_metadata(
-                    correlation_id,
-                    actor_id=command.applicant_id,
-                ),
-            ),
+            )
         ]
+        if not command.process_documents_after_submit:
+            decided_events.append(
+                BaseEvent(
+                    event_type="CreditAnalysisRequested",
+                    payload={
+                        "application_id": command.application_id,
+                        "assigned_agent_id": "credit-analysis-router",
+                        "requested_at": datetime.now(UTC).isoformat(),
+                        "priority": "normal",
+                    },
+                    metadata=_metadata(
+                        correlation_id,
+                        actor_id=command.applicant_id,
+                    ),
+                )
+            )
 
         # 4) Append
-        return await self.store.append(
+        submit_result = await self.store.append(
             stream_id=stream_id,
             aggregate_type="LoanApplication",
             events=decided_events,
             expected_version=loan.version,
             stream_metadata={"application_id": command.application_id},
+        )
+        if not command.process_documents_after_submit:
+            return submit_result
+
+        package_result = await self._append_document_package_events(
+            application_id=command.application_id,
+            document_path=command.document_path or "",
+            correlation_id=correlation_id,
+        )
+        package_causation = (
+            str(package_result.events[-1].event_id) if package_result.events else None
+        )
+        return await self.store.append(
+            stream_id=stream_id,
+            aggregate_type="LoanApplication",
+            events=[
+                BaseEvent(
+                    event_type="CreditAnalysisRequested",
+                    payload={
+                        "application_id": command.application_id,
+                        "assigned_agent_id": "credit-analysis-router",
+                        "requested_at": datetime.now(UTC).isoformat(),
+                        "priority": "normal",
+                        "source": "document_package_ready",
+                        "docpkg_stream_id": _docpkg_stream_id(command.application_id),
+                    },
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=package_causation,
+                        actor_id="document-processing-agent",
+                    ),
+                )
+            ],
+            expected_version=submit_result.new_stream_version,
+        )
+
+    async def _append_document_package_events(
+        self,
+        *,
+        application_id: str,
+        document_path: str,
+        correlation_id: str,
+    ) -> AppendResult:
+        doc_stream_id = _docpkg_stream_id(application_id)
+        current_doc_events = await self.store.load_stream(doc_stream_id)
+        current_version = len(current_doc_events)
+
+        facts = extract_financial_facts(document_path)
+        critical_fields = [
+            "total_revenue",
+            "net_income",
+            "ebitda",
+            "total_assets",
+            "total_liabilities",
+        ]
+        field_confidence = {
+            field: 1.0 if facts.get(field) is not None else 0.0 for field in critical_fields
+        }
+        critical_missing_fields = [
+            field for field, confidence in field_confidence.items() if confidence == 0.0
+        ]
+        extraction_notes = [field for field in critical_missing_fields]
+        confidence_values = list(field_confidence.values())
+        overall_confidence = (
+            sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+        )
+
+        is_coherent = True
+        anomalies: list[str] = []
+        total_assets = facts.get("total_assets")
+        total_liabilities = facts.get("total_liabilities")
+        total_revenue = facts.get("total_revenue")
+        net_income = facts.get("net_income")
+        if (
+            total_assets is not None
+            and total_liabilities is not None
+            and total_assets < total_liabilities
+        ):
+            is_coherent = False
+            anomalies.append("assets_below_liabilities")
+        if (
+            total_revenue is not None
+            and net_income is not None
+            and abs(net_income) > total_revenue * 1.5
+        ):
+            anomalies.append("net_income_implausible_relative_to_revenue")
+
+        extension = Path(document_path).suffix.lower().lstrip(".") or "unknown"
+        now = datetime.now(UTC).isoformat()
+        events: list[BaseEvent] = []
+        if current_version == 0:
+            events.append(
+                BaseEvent(
+                    event_type="PackageCreated",
+                    payload={
+                        "application_id": application_id,
+                        "package_id": application_id,
+                        "created_at": now,
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                )
+            )
+        events.extend(
+            [
+                BaseEvent(
+                    event_type="DocumentAdded",
+                    payload={
+                        "application_id": application_id,
+                        "document_path": document_path,
+                        "document_type": extension,
+                        "added_at": now,
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+                BaseEvent(
+                    event_type="DocumentFormatValidated",
+                    payload={
+                        "application_id": application_id,
+                        "document_path": document_path,
+                        "format": extension,
+                        "is_supported": True,
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+                BaseEvent(
+                    event_type="ExtractionStarted",
+                    payload={
+                        "application_id": application_id,
+                        "document_path": document_path,
+                        "started_at": now,
+                        "pipeline": "document_refinery",
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+                BaseEvent(
+                    event_type="ExtractionCompleted",
+                    payload={
+                        "application_id": application_id,
+                        "document_path": document_path,
+                        "facts": facts,
+                        "field_confidence": field_confidence,
+                        "extraction_notes": extraction_notes,
+                        "completed_at": now,
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+                BaseEvent(
+                    event_type="QualityAssessmentCompleted",
+                    payload={
+                        "application_id": application_id,
+                        "overall_confidence": round(overall_confidence, 3),
+                        "is_coherent": is_coherent,
+                        "anomalies": anomalies,
+                        "critical_missing_fields": critical_missing_fields,
+                        "reextraction_recommended": len(critical_missing_fields) > 0,
+                        "auditor_notes": "Automated quality assessment completed.",
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+                BaseEvent(
+                    event_type="PackageReadyForAnalysis",
+                    payload={
+                        "application_id": application_id,
+                        "package_id": application_id,
+                        "ready_at": now,
+                    },
+                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                ),
+            ]
+        )
+
+        return await self.store.append(
+            stream_id=doc_stream_id,
+            aggregate_type="DocumentPackage",
+            events=events,
+            expected_version=current_version,
+            stream_metadata={"application_id": application_id},
         )
 
     async def handle_start_agent_session(self, command: StartAgentSessionCommand) -> AppendResult:
@@ -600,6 +794,10 @@ def _compliance_stream_id(application_id: str) -> str:
     return f"compliance-{application_id}"
 
 
+def _docpkg_stream_id(application_id: str) -> str:
+    return f"docpkg-{application_id}"
+
+
 def _audit_stream_id(entity_type: str, entity_id: str) -> str:
     return f"audit-{entity_type}-{entity_id}"
 
@@ -633,4 +831,3 @@ def _extract_assessed_max_limit(events: list[StoredEvent]) -> float | None:
     if not limits:
         return None
     return max(limits)
-
