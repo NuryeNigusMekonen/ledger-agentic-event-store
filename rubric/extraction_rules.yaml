@@ -1,0 +1,7 @@
+# Week 3 refinery thresholds and chunking constitution defaults
+fast_text_confidence_gate: 0.90
+layout_aware_confidence_gate: 0.88
+vision_confidence_gate: 0.72
+fast_text_min_chars: 300
+fast_text_max_image_ratio: 0.5
+chunk_max_tokens: 450
