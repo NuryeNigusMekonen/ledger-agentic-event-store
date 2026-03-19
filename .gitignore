@@ -13,6 +13,12 @@ challenge/
 # Generated artifacts
 tmp/
 *.log
+.refinery/extraction_ledger.jsonl
+.refinery/facts.db
+.refinery/profiles/*.json
+!.refinery/profiles/.gitkeep
+.refinery/pageindex/*.json
+!.refinery/pageindex/.gitkeep
 apps/web/node_modules/
 apps/web/dist/
 apps/web/.vite/
