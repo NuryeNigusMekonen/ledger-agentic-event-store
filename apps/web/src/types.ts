@@ -88,6 +88,11 @@ export type RecentEvent = {
   metadata: Record<string, unknown>;
 };
 
+export type AuditTrail = {
+  stream_id: string;
+  events: RecentEvent[];
+};
+
 export type ToolDefinition = {
   name: string;
   description: string;

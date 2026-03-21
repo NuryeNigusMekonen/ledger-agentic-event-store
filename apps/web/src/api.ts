@@ -1,5 +1,6 @@
 import type {
   AgentPerformance,
+  AuditTrail,
   ApiEnvelope,
   AppStateCount,
   ApplicationSummary,
@@ -164,8 +165,16 @@ export async function fetchApplication(applicationId: string): Promise<Applicati
   return await apiRequest<ApplicationSummary>(`/applications/${applicationId}`);
 }
 
-export async function fetchCompliance(applicationId: string): Promise<ComplianceView> {
-  return await apiRequest<ComplianceView>(`/applications/${applicationId}/compliance`);
+export async function fetchCompliance(
+  applicationId: string,
+  asOf?: string
+): Promise<ComplianceView> {
+  const query = asOf ? `?as_of=${encodeURIComponent(asOf)}` : "";
+  return await apiRequest<ComplianceView>(`/applications/${applicationId}/compliance${query}`);
+}
+
+export async function fetchApplicationAuditTrail(applicationId: string): Promise<AuditTrail> {
+  return await apiRequest<AuditTrail>(`/applications/${applicationId}/audit-trail`);
 }
 
 export async function fetchAgentPerformance(agentId: string): Promise<AgentPerformance> {
