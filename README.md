@@ -23,9 +23,10 @@ All code phases are implemented:
 - Phase 6: what-if projector + regulatory package
 - Phase 7: API service + dashboard UI for interactive operations
 - Phase 7.1: JWT auth + RBAC + auth audit trail + role-aware dashboard
+- Phase 7.2: hardening updates (seed-user compatibility, Gemini opt-out fix, stale dashboard focus auto-recovery)
 
 Current integration validation:
-- `14 passed` (full suite with database running)
+- `27 passed` (full suite with database running)
 
 ## Architecture Diagram
 
@@ -373,6 +374,82 @@ or
 make db-stop
 ```
 
+## End-to-End Verification Runbook
+
+This is the recommended challenge proof flow from a clean shell.
+
+1. Setup and local database:
+```bash
+make setup
+make db-start
+make migrate
+```
+
+2. Run full automated verification:
+```bash
+DATABASE_URL=postgresql://postgres@localhost:55432/ledger_event_store .venv/bin/pytest -q -rs
+```
+
+Expected signal:
+- `27 passed`
+- no `FAILED` lines
+
+3. Start API (terminal A):
+```bash
+make api
+```
+
+4. Run live lifecycle + projection proof (terminal B):
+```bash
+set -euo pipefail
+BASE="http://127.0.0.1:8000/api/v1"
+
+TOKEN="$(
+  curl -sS -X POST "$BASE/auth/login" \
+    -H 'content-type: application/json' \
+    -d '{"username":"melat","password":"melat@123"}' \
+  | jq -er '.result.access_token'
+)"
+
+BOOT="$(
+  curl -sS -X POST "$BASE/bootstrap/demo" \
+    -H "authorization: Bearer $TOKEN" \
+    -H 'content-type: application/json' \
+    -d '{}'
+)"
+
+APP_ID="$(echo "$BOOT" | jq -er '.result.application_id')"
+STATE="$(curl -sS "$BASE/applications/$APP_ID" -H "authorization: Bearer $TOKEN" | jq -er '.result.current_state')"
+COMP="$(curl -sS "$BASE/applications/$APP_ID/compliance" -H "authorization: Bearer $TOKEN" | jq -er '.result.snapshot.compliance_status')"
+COUNT="$(curl -sS "$BASE/events/recent?limit=10" -H "authorization: Bearer $TOKEN" | jq -er '.result.count')"
+METRIC="$(curl -sS "$BASE/metrics" -H "authorization: Bearer $TOKEN" | rg '^ledger_projection_events_behind')"
+
+echo "application_id: $APP_ID"
+echo "state: $STATE"
+echo "compliance: $COMP"
+echo "recent_events_count: $COUNT"
+echo "$METRIC"
+
+test "$STATE" = "FINAL_APPROVED"
+test "$COMP" = "CLEARED"
+test "$COUNT" -gt 0
+echo "DEMO PASS"
+```
+
+Expected signal:
+- `state: FINAL_APPROVED`
+- `compliance: CLEARED`
+- `recent_events_count` greater than `0`
+- `ledger_projection_events_behind{...} 0` for projections
+- final line `DEMO PASS`
+
+5. Optional dashboard run:
+```bash
+make web-install
+make web
+```
+Open `http://localhost:5173`.
+
 ## Phase 7: API + Dashboard
 
 ### Backend API
@@ -408,22 +485,36 @@ JWT_SECRET=replace-with-long-random-secret
 JWT_ISSUER=ledger-api
 JWT_TTL_MINUTES=120
 SEED_DEMO_USERS=true
+LEDGER_ANALYST_ONE_USERNAME=melat
+LEDGER_ANALYST_ONE_PASSWORD=melat@123
+LEDGER_ANALYST_TWO_USERNAME=kedir
+LEDGER_ANALYST_TWO_PASSWORD=kedir@123
+LEDGER_ADMIN_USERNAME=nurye
+LEDGER_ADMIN_PASSWORD=nurye@123
 ```
 
 If your dashboard is opened via LAN IP (example `http://10.69.158.161:5173`), add that origin to
 `API_CORS_ORIGINS` in `.env` and restart API.
 
 Default seeded users when `SEED_DEMO_USERS=true`:
-- `analyst / analyst123!`
-- `compliance / compliance123!`
-- `ops / ops123!`
-- `admin / admin123!`
+- `analyst / analyst123!` (analyst, compatibility user)
+- `compliance / compliance123!` (compliance, compatibility user)
+- `ops / ops123!` (ops, compatibility user)
+- `admin / admin123!` (admin, compatibility user)
+- `melat / melat@123` (analyst)
+- `kedir / kedir@123` (analyst)
+- `nurye / nurye@123` (admin)
+
+Other users are marked inactive by default at startup. You can change demo credentials with:
+- `LEDGER_ANALYST_ONE_USERNAME`, `LEDGER_ANALYST_ONE_PASSWORD`
+- `LEDGER_ANALYST_TWO_USERNAME`, `LEDGER_ANALYST_TWO_PASSWORD`
+- `LEDGER_ADMIN_USERNAME`, `LEDGER_ADMIN_PASSWORD`
 
 Role policy highlights:
-- `analyst`: can run application/agent/decision commands, cannot run integrity checks or rebuild
-- `compliance`: can run compliance + integrity commands and view auth audit logs
-- `ops`: can run operational write commands and rebuild projections
-- `admin`: full access
+- `analyst`: standard write operations for case progression
+- `admin`: full access including integrity verification, audit log access, and projection rebuild
+
+If needed, you can manually provision additional roles directly in `auth_users`.
 
 ### React Dashboard
 
@@ -528,7 +619,7 @@ asyncio.run(main())
 
 Run everything:
 ```bash
-DATABASE_URL=postgresql://postgres@localhost:55432/ledger_event_store .venv/bin/pytest -q
+DATABASE_URL=postgresql://postgres@localhost:55432/ledger_event_store .venv/bin/pytest -q -rs
 ```
 
 Run key integration slices:
@@ -566,3 +657,14 @@ Set `DATABASE_URL` and start DB first.
 
 - Root-level `models/` is an unused scaffold folder; active models are in `src/models/`.
 - Local DB data and runtime files are ignored via `.gitignore` under `.local/postgres/`.
+
+## Shutdown
+
+When finishing:
+
+1. Stop the API process (`Ctrl+C`) in its terminal.
+2. Stop the dashboard dev server (`Ctrl+C`) if running.
+3. Stop project-local PostgreSQL:
+```bash
+make db-stop
+```
