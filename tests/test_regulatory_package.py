@@ -11,7 +11,16 @@ from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
 from src.integrity.audit_chain import attach_integrity_chain
-from src.models.events import BaseEvent
+from src.models.events import (
+    AgentContextLoadedEvent,
+    ApplicationApprovedEvent,
+    ApplicationSubmittedEvent,
+    ComplianceCheckRequestedEvent,
+    ComplianceRulePassedEvent,
+    CreditAnalysisCompletedEvent,
+    DecisionGeneratedEvent,
+    HumanReviewCompletedEvent,
+)
 from src.regulatory.package import generate_regulatory_package
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -71,8 +80,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
         stream_id=loan_stream,
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="ApplicationSubmitted",
+            ApplicationSubmittedEvent(
                 payload={
                     "application_id": app_id,
                     "applicant_id": "customer-1",
@@ -83,9 +91,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
                 },
                 metadata={"correlation_id": "corr-reg-1"},
             ),
-            BaseEvent(
-                event_type="DecisionGenerated",
-                event_version=2,
+            DecisionGeneratedEvent(
                 payload={
                     "application_id": app_id,
                     "orchestrator_agent_id": "orchestrator-1",
@@ -99,8 +105,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
                 },
                 metadata={"correlation_id": "corr-reg-1"},
             ),
-            BaseEvent(
-                event_type="HumanReviewCompleted",
+            HumanReviewCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "reviewer_id": "loan-officer-2",
@@ -109,8 +114,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
                 },
                 metadata={"correlation_id": "corr-reg-1"},
             ),
-            BaseEvent(
-                event_type="ApplicationApproved",
+            ApplicationApprovedEvent(
                 payload={
                     "application_id": app_id,
                     "approved_amount_usd": 14000,
@@ -135,8 +139,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="AgentContextLoaded",
+            AgentContextLoadedEvent(
                 payload={
                     "agent_id": "credit-agent-2",
                     "session_id": "session-9",
@@ -146,9 +149,7 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
                     "model_version": "credit-v3",
                 },
             ),
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "agent_id": "credit-agent-2",
@@ -169,16 +170,14 @@ async def test_generate_regulatory_package_outputs_self_contained_json(store: Ev
         aggregate_type="ComplianceRecord",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="ComplianceCheckRequested",
+            ComplianceCheckRequestedEvent(
                 payload={
                     "application_id": app_id,
                     "regulation_set_version": "2026.03",
                     "checks_required": ["rule-a"],
                 },
             ),
-            BaseEvent(
-                event_type="ComplianceRulePassed",
+            ComplianceRulePassedEvent(
                 payload={
                     "application_id": app_id,
                     "rule_id": "rule-a",

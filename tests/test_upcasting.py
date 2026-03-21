@@ -9,7 +9,7 @@ import pytest_asyncio
 from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
-from src.models.events import BaseEvent
+from src.models.events import CreditAnalysisCompletedEvent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -68,8 +68,7 @@ async def test_credit_analysis_v1_upcasted_to_v2_without_mutating_raw_row(
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
+            CreditAnalysisCompletedEvent(
                 event_version=1,
                 payload=original_payload,
                 metadata={},

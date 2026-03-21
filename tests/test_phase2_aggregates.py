@@ -32,7 +32,7 @@ def _stored_event(
 
 
 def test_agent_session_requires_context_before_output() -> None:
-    aggregate = AgentSessionAggregate.load([])
+    aggregate = AgentSessionAggregate.replay([])
     with pytest.raises(DomainError):
         aggregate.apply(
             _stored_event(
@@ -48,7 +48,7 @@ def test_agent_session_requires_context_before_output() -> None:
 
 
 def test_loan_approval_rejected_when_compliance_pending() -> None:
-    aggregate = LoanApplicationAggregate.load([])
+    aggregate = LoanApplicationAggregate.replay([])
     aggregate.apply(
         _stored_event(
             event_type="ApplicationSubmitted",
@@ -61,6 +61,13 @@ def test_loan_approval_rejected_when_compliance_pending() -> None:
     )
     aggregate.apply(
         _stored_event(
+            event_type="CreditAnalysisRequested",
+            payload={"application_id": "app-1"},
+            position=2,
+        )
+    )
+    aggregate.apply(
+        _stored_event(
             event_type="DecisionGenerated",
             payload={
                 "application_id": "app-1",
@@ -69,7 +76,7 @@ def test_loan_approval_rejected_when_compliance_pending() -> None:
                 "assessed_max_limit_usd": 700,
                 "contributing_agent_sessions": ["agent-a-s1"],
             },
-            position=2,
+            position=3,
         )
     )
     aggregate.apply(
@@ -81,7 +88,7 @@ def test_loan_approval_rejected_when_compliance_pending() -> None:
                 "override": False,
                 "final_decision": "APPROVE",
             },
-            position=3,
+            position=4,
         )
     )
 
@@ -93,13 +100,13 @@ def test_loan_approval_rejected_when_compliance_pending() -> None:
                     "application_id": "app-1",
                     "approved_amount_usd": 600,
                 },
-                position=4,
+                position=5,
             )
         )
 
 
 def test_compliance_status_moves_to_cleared_when_all_checks_pass() -> None:
-    aggregate = ComplianceRecordAggregate.load([])
+    aggregate = ComplianceRecordAggregate.replay([])
     aggregate.apply(
         _stored_event(
             event_type="ComplianceCheckRequested",
@@ -138,4 +145,3 @@ def test_compliance_status_moves_to_cleared_when_all_checks_pass() -> None:
         )
     )
     assert aggregate.status == "CLEARED"
-

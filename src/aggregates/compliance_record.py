@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from src.models.events import DomainError, StoredEvent
+from src.models.events import (
+    ComplianceCheckRequestedPayload,
+    ComplianceRuleFailedPayload,
+    ComplianceRulePassedPayload,
+    DomainError,
+    StoredEvent,
+)
+
+if TYPE_CHECKING:
+    from src.event_store import EventStore
 
 
 @dataclass
@@ -17,11 +26,16 @@ class ComplianceRecordAggregate:
     version: int = 0
 
     @classmethod
-    def load(cls, events: list[StoredEvent]) -> ComplianceRecordAggregate:
+    def replay(cls, events: list[StoredEvent]) -> ComplianceRecordAggregate:
         aggregate = cls()
         for event in events:
             aggregate.apply(event)
         return aggregate
+
+    @classmethod
+    async def load(cls, store: EventStore, stream_id: str) -> ComplianceRecordAggregate:
+        events = await store.load_stream(stream_id)
+        return cls.replay(events)
 
     @property
     def is_pending(self) -> bool:
@@ -59,18 +73,20 @@ class ComplianceRecordAggregate:
             raise DomainError(
                 "ComplianceCheckRequested can only happen once per compliance stream."
             )
-        checks_required = [str(item) for item in payload.get("checks_required", [])]
+        typed = ComplianceCheckRequestedPayload.model_validate(payload)
+        checks_required = [str(item) for item in typed.checks_required]
         if not checks_required:
             raise DomainError("ComplianceCheckRequested requires non-empty checks_required.")
-        self.application_id = payload["application_id"]
-        self.regulation_set_version = str(payload["regulation_set_version"])
+        self.application_id = typed.application_id
+        self.regulation_set_version = typed.regulation_set_version
         self.mandatory_checks = set(checks_required)
         self.status = "PENDING"
 
     def _apply_rule_passed(self, payload: dict[str, Any]) -> None:
         self._require_started()
-        rule_id = str(payload["rule_id"])
-        rule_version = str(payload.get("rule_version", "")).strip()
+        typed = ComplianceRulePassedPayload.model_validate(payload)
+        rule_id = typed.rule_id
+        rule_version = typed.rule_version.strip()
         if not rule_version:
             raise DomainError("ComplianceRulePassed requires rule_version.")
         self._validate_rule_membership(rule_id)
@@ -81,12 +97,13 @@ class ComplianceRecordAggregate:
 
     def _apply_rule_failed(self, payload: dict[str, Any]) -> None:
         self._require_started()
-        rule_id = str(payload["rule_id"])
-        rule_version = str(payload.get("rule_version", "")).strip()
+        typed = ComplianceRuleFailedPayload.model_validate(payload)
+        rule_id = typed.rule_id
+        rule_version = typed.rule_version.strip()
         if not rule_version:
             raise DomainError("ComplianceRuleFailed requires rule_version.")
         self._validate_rule_membership(rule_id)
-        reason = str(payload.get("failure_reason", "")).strip()
+        reason = typed.failure_reason.strip()
         if not reason:
             raise DomainError("ComplianceRuleFailed requires failure_reason.")
         self.failed_checks[rule_id] = reason

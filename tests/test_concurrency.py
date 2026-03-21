@@ -10,7 +10,14 @@ import pytest_asyncio
 from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
-from src.models.events import AppendResult, BaseEvent, OptimisticConcurrencyError
+from src.models.events import (
+    AppendResult,
+    ApplicationSubmittedEvent,
+    ComplianceCheckRequestedEvent,
+    CreditAnalysisRequestedEvent,
+    DecisionGeneratedEvent,
+    OptimisticConcurrencyError,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -58,9 +65,24 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
 
     # Seed the stream to version 3 so both contenders race on expected_version=3.
     initial_events = [
-        BaseEvent(event_type="ApplicationSubmitted", payload={"step": 1}),
-        BaseEvent(event_type="CreditAnalysisRequested", payload={"step": 2}),
-        BaseEvent(event_type="ComplianceCheckRequested", payload={"step": 3}),
+        ApplicationSubmittedEvent(
+            payload={"application_id": stream_id, "requested_amount_usd": 1}
+        ),
+        CreditAnalysisRequestedEvent(
+            payload={
+                "application_id": stream_id,
+                "assigned_agent_id": "race-agent",
+                "requested_at": "2026-01-01T00:00:00+00:00",
+                "priority": "normal",
+            }
+        ),
+        ComplianceCheckRequestedEvent(
+            payload={
+                "application_id": stream_id,
+                "regulation_set_version": "2026.03",
+                "checks_required": ["rule-1"],
+            }
+        ),
     ]
     seeded = await store.append(
         stream_id=stream_id,
@@ -77,7 +99,19 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
         return await store.append(
             stream_id=stream_id,
             aggregate_type="LoanApplication",
-            events=[BaseEvent(event_type="DecisionGenerated", payload={"agent": label})],
+            events=[
+                DecisionGeneratedEvent(
+                    payload={
+                        "application_id": stream_id,
+                        "orchestrator_agent_id": label,
+                        "recommendation": "REFER",
+                        "confidence_score": 0.61,
+                        "contributing_agent_sessions": [],
+                        "decision_basis_summary": "concurrency-race",
+                        "model_versions": {},
+                    }
+                )
+            ],
             expected_version=3,
             correlation_id="corr-concurrency-race",
             causation_id="cause-concurrency-race",

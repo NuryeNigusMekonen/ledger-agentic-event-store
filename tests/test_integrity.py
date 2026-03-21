@@ -10,7 +10,7 @@ from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
 from src.integrity.audit_chain import attach_integrity_chain, run_integrity_check
-from src.models.events import BaseEvent
+from src.models.events import ApplicationSubmittedEvent, DecisionGeneratedEvent
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -55,13 +55,10 @@ async def store() -> EventStore:
 async def test_integrity_chain_detects_tampering(store: EventStore) -> None:
     stream_id = f"loan-{uuid4()}"
     base_events = [
-        BaseEvent(
-            event_type="ApplicationSubmitted",
+        ApplicationSubmittedEvent(
             payload={"application_id": "app-1", "requested_amount_usd": 1000},
         ),
-        BaseEvent(
-            event_type="DecisionGenerated",
-            event_version=2,
+        DecisionGeneratedEvent(
             payload={
                 "application_id": "app-1",
                 "recommendation": "DECLINE",
@@ -101,4 +98,3 @@ async def test_integrity_chain_detects_tampering(store: EventStore) -> None:
     assert tampered.chain_valid is False
     assert len(tampered.violations) >= 1
     assert tampered.violations[0].stream_position == 2
-

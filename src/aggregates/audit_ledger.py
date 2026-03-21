@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from src.models.events import DomainError, StoredEvent
+from src.models.events import AuditIntegrityCheckRunPayload, DomainError, StoredEvent
+
+if TYPE_CHECKING:
+    from src.event_store import EventStore
 
 
 @dataclass
@@ -14,11 +17,16 @@ class AuditLedgerAggregate:
     known_event_ids: set[str] = field(default_factory=set)
 
     @classmethod
-    def load(cls, events: list[StoredEvent]) -> AuditLedgerAggregate:
+    def replay(cls, events: list[StoredEvent]) -> AuditLedgerAggregate:
         aggregate = cls()
         for event in events:
             aggregate.apply(event)
         return aggregate
+
+    @classmethod
+    async def load(cls, store: EventStore, stream_id: str) -> AuditLedgerAggregate:
+        events = await store.load_stream(stream_id)
+        return cls.replay(events)
 
     def apply(self, event: StoredEvent) -> None:
         self._apply(event.event_type, event.payload, event.metadata)
@@ -30,6 +38,7 @@ class AuditLedgerAggregate:
         payload: dict[str, Any],
         metadata: dict[str, Any],
     ) -> None:
+        typed = AuditIntegrityCheckRunPayload.model_validate(payload)
         correlation_id = metadata.get("correlation_id")
         if not correlation_id:
             raise DomainError("Audit events require metadata.correlation_id.")
@@ -40,14 +49,15 @@ class AuditLedgerAggregate:
                 "Audit causation_id must reference an existing event in the audit stream."
             )
 
-        verified = int(payload.get("events_verified_count", 0))
+        verified = int(typed.events_verified_count)
         if verified < 0:
             raise DomainError("events_verified_count cannot be negative.")
-        if not payload.get("integrity_hash"):
+        if not typed.integrity_hash:
             raise DomainError("AuditIntegrityCheckRun requires integrity_hash.")
 
     def _apply(self, event_type: str, payload: dict[str, Any], metadata: dict[str, Any]) -> None:
         if event_type != "AuditIntegrityCheckRun":
             return
         self.validate_new_integrity_event(payload=payload, metadata=metadata)
-        self.entity_id = payload.get("entity_id", self.entity_id)
+        typed = AuditIntegrityCheckRunPayload.model_validate(payload)
+        self.entity_id = typed.entity_id or self.entity_id

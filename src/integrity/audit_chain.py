@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+from pydantic import BaseModel
 
 from src.event_store import EventStore
 from src.models.events import BaseEvent, StoredEvent
@@ -79,7 +80,7 @@ def attach_integrity_chain(
             stream_position=stream_position,
             event_type=event.event_type,
             event_version=event.event_version,
-            payload=event.payload,
+            payload=_json_object(event.payload),
             metadata=base_metadata,
             previous_hash=last_hash,
         )
@@ -195,3 +196,8 @@ def _row_to_stored_event(row: asyncpg.Record) -> StoredEvent:
         recorded_at=row["recorded_at"],
     )
 
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return dict(value)

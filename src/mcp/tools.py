@@ -332,7 +332,7 @@ class LedgerMCPTools:
     async def record_credit_analysis(self, arguments: dict[str, Any]) -> dict[str, Any]:
         params = RecordCreditAnalysisInput.model_validate(arguments)
         session_stream = f"agent-{params.agent_id}-{params.session_id}"
-        session = AgentSessionAggregate.load(await self.store.load_stream(session_stream))
+        session = await AgentSessionAggregate.load(self.store, session_stream)
 
         if not session.context_loaded:
             return _error(
@@ -369,7 +369,7 @@ class LedgerMCPTools:
     async def record_fraud_screening(self, arguments: dict[str, Any]) -> dict[str, Any]:
         params = RecordFraudScreeningInput.model_validate(arguments)
         session_stream = f"agent-{params.agent_id}-{params.session_id}"
-        session = AgentSessionAggregate.load(await self.store.load_stream(session_stream))
+        session = await AgentSessionAggregate.load(self.store, session_stream)
         if not session.context_loaded:
             return _error(
                 error_type="PreconditionFailed",
@@ -403,7 +403,7 @@ class LedgerMCPTools:
     async def record_compliance_check(self, arguments: dict[str, Any]) -> dict[str, Any]:
         params = RecordComplianceCheckInput.model_validate(arguments)
         stream_id = f"compliance-{params.application_id}"
-        compliance = ComplianceRecordAggregate.load(await self.store.load_stream(stream_id))
+        compliance = await ComplianceRecordAggregate.load(self.store, stream_id)
         if compliance.status != "NOT_STARTED" and params.rule_id not in compliance.mandatory_checks:
             return _error(
                 error_type="PreconditionFailed",

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from pydantic import BaseModel
 
 from src.commands.handlers import (
     CreditAnalysisCompletedCommand,
@@ -49,7 +50,7 @@ class RecordingStore:
                     global_position=1000 + offset,
                     event_type=event.event_type,
                     event_version=event.event_version,
-                    payload=event.payload,
+                    payload=_json_object(event.payload),
                     metadata=event.metadata,
                     recorded_at=datetime.now(UTC),
                 )
@@ -81,6 +82,12 @@ def _stored_event(
         metadata=metadata or {},
         recorded_at=datetime.now(UTC),
     )
+
+
+def _json_object(value: object) -> dict[str, object]:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return dict(value)
 
 
 @pytest.mark.asyncio

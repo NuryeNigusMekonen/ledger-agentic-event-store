@@ -10,7 +10,11 @@ from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
 from src.integrity.gas_town import reconstruct_agent_context
-from src.models.events import BaseEvent
+from src.models.events import (
+    AgentContextLoadedEvent,
+    CreditAnalysisCompletedEvent,
+    FraudScreeningCompletedEvent,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -62,8 +66,7 @@ async def test_reconstruct_agent_context_respects_token_budget(store: EventStore
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="AgentContextLoaded",
+            AgentContextLoadedEvent(
                 payload={
                     "agent_id": agent_id,
                     "session_id": session_id,
@@ -73,9 +76,7 @@ async def test_reconstruct_agent_context_respects_token_budget(store: EventStore
                     "model_version": "model-v1",
                 },
             ),
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": "app-1",
                     "agent_id": agent_id,
@@ -88,8 +89,7 @@ async def test_reconstruct_agent_context_respects_token_budget(store: EventStore
                     "input_data_hash": "hash-" + ("x" * 800),
                 },
             ),
-            BaseEvent(
-                event_type="FraudScreeningCompleted",
+            FraudScreeningCompletedEvent(
                 payload={
                     "application_id": "app-1",
                     "agent_id": agent_id,
@@ -127,9 +127,7 @@ async def test_reconstruct_agent_context_flags_missing_context_loaded(store: Eve
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": "app-2",
                     "agent_id": agent_id,
@@ -154,4 +152,3 @@ async def test_reconstruct_agent_context_flags_missing_context_loaded(store: Eve
     assert context.needs_reconciliation is True
     assert "missing_agent_context_loaded" in context.reconciliation_reasons
     assert context.last_stream_position == 1
-

@@ -9,7 +9,14 @@ import pytest_asyncio
 from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
-from src.models.events import BaseEvent
+from src.models.events import (
+    AgentContextLoadedEvent,
+    ApplicationSubmittedEvent,
+    ComplianceCheckRequestedEvent,
+    ComplianceRulePassedEvent,
+    CreditAnalysisCompletedEvent,
+    DecisionGeneratedEvent,
+)
 from src.projections.agent_performance import AgentPerformanceLedgerProjection
 from src.projections.application_summary import ApplicationSummaryProjection
 from src.projections.compliance_audit import ComplianceAuditViewProjection
@@ -76,13 +83,10 @@ async def test_projection_daemon_updates_tables_and_lag(store: EventStore) -> No
         aggregate_type="LoanApplication",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="ApplicationSubmitted",
+            ApplicationSubmittedEvent(
                 payload={"application_id": app_id, "requested_amount_usd": 10000},
             ),
-            BaseEvent(
-                event_type="DecisionGenerated",
-                event_version=2,
+            DecisionGeneratedEvent(
                 payload={
                     "application_id": app_id,
                     "recommendation": "APPROVE",
@@ -101,17 +105,14 @@ async def test_projection_daemon_updates_tables_and_lag(store: EventStore) -> No
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="AgentContextLoaded",
+            AgentContextLoadedEvent(
                 payload={
                     "agent_id": agent_id,
                     "session_id": session_id,
                     "model_version": "credit-v1",
                 },
             ),
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "agent_id": agent_id,
@@ -191,8 +192,7 @@ async def test_compliance_temporal_query_and_rebuild(store: EventStore) -> None:
         aggregate_type="ComplianceRecord",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="ComplianceCheckRequested",
+            ComplianceCheckRequestedEvent(
                 payload={
                     "application_id": app_id,
                     "regulation_set_version": "2026.03",
@@ -206,8 +206,7 @@ async def test_compliance_temporal_query_and_rebuild(store: EventStore) -> None:
         aggregate_type="ComplianceRecord",
         expected_version=1,
         events=[
-            BaseEvent(
-                event_type="ComplianceRulePassed",
+            ComplianceRulePassedEvent(
                 payload={
                     "application_id": app_id,
                     "rule_id": "rule-a",
@@ -221,8 +220,7 @@ async def test_compliance_temporal_query_and_rebuild(store: EventStore) -> None:
         aggregate_type="ComplianceRecord",
         expected_version=2,
         events=[
-            BaseEvent(
-                event_type="ComplianceRulePassed",
+            ComplianceRulePassedEvent(
                 payload={
                     "application_id": app_id,
                     "rule_id": "rule-b",

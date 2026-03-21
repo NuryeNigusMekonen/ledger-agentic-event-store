@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from src.models.events import DomainError, StoredEvent
+from src.models.events import (
+    AgentContextLoadedPayload,
+    CreditAnalysisCompletedPayload,
+    DomainError,
+    FraudScreeningCompletedPayload,
+    StoredEvent,
+)
+
+if TYPE_CHECKING:
+    from src.event_store import EventStore
 
 
 @dataclass
@@ -16,11 +25,16 @@ class AgentSessionAggregate:
     output_event_count: int = 0
 
     @classmethod
-    def load(cls, events: list[StoredEvent]) -> AgentSessionAggregate:
+    def replay(cls, events: list[StoredEvent]) -> AgentSessionAggregate:
         aggregate = cls()
         for event in events:
             aggregate.apply(event)
         return aggregate
+
+    @classmethod
+    async def load(cls, store: EventStore, stream_id: str) -> AgentSessionAggregate:
+        events = await store.load_stream(stream_id)
+        return cls.replay(events)
 
     def apply(self, event: StoredEvent) -> None:
         self._apply(event.event_type, event.payload)
@@ -89,20 +103,23 @@ class AgentSessionAggregate:
     def _apply_agent_context_loaded(self, payload: dict[str, Any]) -> None:
         if self.context_loaded:
             raise DomainError("AgentContextLoaded can only happen once per session stream.")
-        self.agent_id = payload["agent_id"]
-        self.session_id = payload["session_id"]
-        model_version = str(payload.get("model_version", "")).strip()
+        typed = AgentContextLoadedPayload.model_validate(payload)
+        self.agent_id = typed.agent_id
+        self.session_id = typed.session_id
+        model_version = typed.model_version.strip()
         if not model_version:
             raise DomainError("AgentContextLoaded requires model_version.")
         self.model_version = model_version
         self.context_loaded = True
 
     def _apply_credit_analysis_completed(self, payload: dict[str, Any]) -> None:
-        model_version = str(payload.get("model_version", "")).strip()
+        typed = CreditAnalysisCompletedPayload.model_validate(payload)
+        model_version = str(typed.model_version or "").strip()
         self.ensure_ready_for_output("CreditAnalysisCompleted", model_version=model_version)
         self.output_event_count += 1
 
     def _apply_fraud_screening_completed(self, payload: dict[str, Any]) -> None:
-        model_version = str(payload.get("screening_model_version", "")).strip()
+        typed = FraudScreeningCompletedPayload.model_validate(payload)
+        model_version = typed.screening_model_version.strip()
         self.ensure_ready_for_output("FraudScreeningCompleted", model_version=model_version)
         self.output_event_count += 1

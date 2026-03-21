@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import asyncpg
+from pydantic import BaseModel
 
 from src.models.events import (
     AppendResult,
@@ -176,7 +177,7 @@ class EventStore:
                         stream_position,
                         event.event_type,
                         event.event_version,
-                        event.payload,
+                        _json_object(event.payload),
                         event_metadata,
                     )
                     inserted = _row_to_stored_event(row)
@@ -514,3 +515,9 @@ def _event_metadata_with_lineage(
     if causation_id is not None:
         enriched["causation_id"] = causation_id
     return enriched
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return dict(value)

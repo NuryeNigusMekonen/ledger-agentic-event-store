@@ -10,7 +10,25 @@ from src.aggregates.audit_ledger import AuditLedgerAggregate
 from src.aggregates.compliance_record import ComplianceRecordAggregate
 from src.aggregates.loan_application import LoanApplicationAggregate, LoanStatus
 from src.event_store import EventStore
-from src.models.events import AppendResult, BaseEvent, DomainError, StoredEvent
+from src.models.events import (
+    AgentContextLoadedEvent,
+    ApplicationApprovedEvent,
+    ApplicationDeclinedEvent,
+    ApplicationSubmittedEvent,
+    AppendResult,
+    AuditIntegrityCheckRunEvent,
+    BaseEvent,
+    ComplianceCheckRequestedEvent,
+    ComplianceRuleFailedEvent,
+    ComplianceRulePassedEvent,
+    CreditAnalysisCompletedEvent,
+    CreditAnalysisRequestedEvent,
+    DecisionGeneratedEvent,
+    DomainError,
+    FraudScreeningCompletedEvent,
+    HumanReviewCompletedEvent,
+    StoredEvent,
+)
 from src.refinery.pipeline import extract_financial_facts
 
 
@@ -130,8 +148,7 @@ class WriteCommandHandlers:
     async def handle_submit_application(self, command: SubmitApplicationCommand) -> AppendResult:
         # 1) Load
         stream_id = _loan_stream_id(command.application_id)
-        stream_events = await self.store.load_stream(stream_id)
-        loan = LoanApplicationAggregate.load(stream_events)
+        loan = await LoanApplicationAggregate.load(self.store, stream_id)
 
         # 2) Validate
         if not loan.can_submit():
@@ -153,8 +170,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events: list[BaseEvent] = [
-            BaseEvent(
-                event_type="ApplicationSubmitted",
+            ApplicationSubmittedEvent(
                 payload={
                     "application_id": command.application_id,
                     "applicant_id": command.applicant_id,
@@ -172,8 +188,7 @@ class WriteCommandHandlers:
         ]
         if not command.process_documents_after_submit:
             decided_events.append(
-                BaseEvent(
-                    event_type="CreditAnalysisRequested",
+                CreditAnalysisRequestedEvent(
                     payload={
                         "application_id": command.application_id,
                         "assigned_agent_id": "credit-analysis-router",
@@ -214,8 +229,7 @@ class WriteCommandHandlers:
             stream_id=stream_id,
             aggregate_type="LoanApplication",
             events=[
-                BaseEvent(
-                    event_type="CreditAnalysisRequested",
+                CreditAnalysisRequestedEvent(
                     payload={
                         "application_id": command.application_id,
                         "assigned_agent_id": "credit-analysis-router",
@@ -385,8 +399,7 @@ class WriteCommandHandlers:
     async def handle_start_agent_session(self, command: StartAgentSessionCommand) -> AppendResult:
         # 1) Load
         stream_id = _agent_stream_id(command.agent_id, command.session_id)
-        stream_events = await self.store.load_stream(stream_id)
-        session = AgentSessionAggregate.load(stream_events)
+        session = await AgentSessionAggregate.load(self.store, stream_id)
 
         # 2) Validate
         if session.context_loaded:
@@ -398,8 +411,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events = [
-            BaseEvent(
-                event_type="AgentContextLoaded",
+            AgentContextLoadedEvent(
                 payload={
                     "agent_id": command.agent_id,
                     "session_id": command.session_id,
@@ -436,12 +448,10 @@ class WriteCommandHandlers:
     ) -> AppendResult:
         # 1) Load
         session_stream_id = _agent_stream_id(command.agent_id, command.session_id)
-        session_events = await self.store.load_stream(session_stream_id)
-        session = AgentSessionAggregate.load(session_events)
+        session = await AgentSessionAggregate.load(self.store, session_stream_id)
 
         loan_stream_id = _loan_stream_id(command.application_id)
-        loan_events = await self.store.load_stream(loan_stream_id)
-        loan = LoanApplicationAggregate.load(loan_events)
+        loan = await LoanApplicationAggregate.load(self.store, loan_stream_id)
 
         # 2) Validate
         loan.ensure_can_record_agent_analysis(command.application_id)
@@ -457,9 +467,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events = [
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": command.application_id,
                     "agent_id": command.agent_id,
@@ -495,12 +503,10 @@ class WriteCommandHandlers:
     ) -> AppendResult:
         # 1) Load
         session_stream_id = _agent_stream_id(command.agent_id, command.session_id)
-        session_events = await self.store.load_stream(session_stream_id)
-        session = AgentSessionAggregate.load(session_events)
+        session = await AgentSessionAggregate.load(self.store, session_stream_id)
 
         loan_stream_id = _loan_stream_id(command.application_id)
-        loan_events = await self.store.load_stream(loan_stream_id)
-        loan = LoanApplicationAggregate.load(loan_events)
+        loan = await LoanApplicationAggregate.load(self.store, loan_stream_id)
 
         # 2) Validate
         loan.ensure_can_record_agent_analysis(command.application_id)
@@ -514,8 +520,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events = [
-            BaseEvent(
-                event_type="FraudScreeningCompleted",
+            FraudScreeningCompletedEvent(
                 payload={
                     "application_id": command.application_id,
                     "agent_id": command.agent_id,
@@ -545,8 +550,7 @@ class WriteCommandHandlers:
     async def handle_compliance_check(self, command: ComplianceCheckCommand) -> AppendResult:
         # 1) Load
         stream_id = _compliance_stream_id(command.application_id)
-        events = await self.store.load_stream(stream_id)
-        compliance = ComplianceRecordAggregate.load(events)
+        compliance = await ComplianceRecordAggregate.load(self.store, stream_id)
 
         # 2) Validate
         if not command.rule_version:
@@ -567,8 +571,7 @@ class WriteCommandHandlers:
 
         if compliance.status == "NOT_STARTED":
             decided_events.append(
-                BaseEvent(
-                    event_type="ComplianceCheckRequested",
+                ComplianceCheckRequestedEvent(
                     payload={
                         "application_id": command.application_id,
                         "regulation_set_version": command.regulation_set_version,
@@ -584,8 +587,7 @@ class WriteCommandHandlers:
 
         if command.passed:
             decided_events.append(
-                BaseEvent(
-                    event_type="ComplianceRulePassed",
+                ComplianceRulePassedEvent(
                     payload={
                         "application_id": command.application_id,
                         "rule_id": command.rule_id,
@@ -602,8 +604,7 @@ class WriteCommandHandlers:
             )
         else:
             decided_events.append(
-                BaseEvent(
-                    event_type="ComplianceRuleFailed",
+                ComplianceRuleFailedEvent(
                     payload={
                         "application_id": command.application_id,
                         "rule_id": command.rule_id,
@@ -633,12 +634,10 @@ class WriteCommandHandlers:
     async def handle_generate_decision(self, command: GenerateDecisionCommand) -> AppendResult:
         # 1) Load
         loan_stream_id = _loan_stream_id(command.application_id)
-        loan_events = await self.store.load_stream(loan_stream_id)
-        loan = LoanApplicationAggregate.load(loan_events)
+        loan = await LoanApplicationAggregate.load(self.store, loan_stream_id)
 
         compliance_stream_id = _compliance_stream_id(command.application_id)
-        compliance_events = await self.store.load_stream(compliance_stream_id)
-        compliance = ComplianceRecordAggregate.load(compliance_events)
+        compliance = await ComplianceRecordAggregate.load(self.store, compliance_stream_id)
 
         contributing_events = await self._load_contributing_agent_events(
             command.contributing_agent_sessions
@@ -669,9 +668,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events = [
-            BaseEvent(
-                event_type="DecisionGenerated",
-                event_version=2,
+            DecisionGeneratedEvent(
                 payload={
                     "application_id": command.application_id,
                     "orchestrator_agent_id": command.orchestrator_agent_id,
@@ -707,12 +704,10 @@ class WriteCommandHandlers:
     ) -> AppendResult:
         # 1) Load
         loan_stream_id = _loan_stream_id(command.application_id)
-        loan_events = await self.store.load_stream(loan_stream_id)
-        loan = LoanApplicationAggregate.load(loan_events)
+        loan = await LoanApplicationAggregate.load(self.store, loan_stream_id)
 
         compliance_stream_id = _compliance_stream_id(command.application_id)
-        compliance_events = await self.store.load_stream(compliance_stream_id)
-        compliance = ComplianceRecordAggregate.load(compliance_events)
+        compliance = await ComplianceRecordAggregate.load(self.store, compliance_stream_id)
 
         # 2) Validate
         if loan.status == LoanStatus.EMPTY:
@@ -728,8 +723,7 @@ class WriteCommandHandlers:
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
         decided_events: list[BaseEvent] = [
-            BaseEvent(
-                event_type="HumanReviewCompleted",
+            HumanReviewCompletedEvent(
                 payload={
                     "application_id": command.application_id,
                     "reviewer_id": command.reviewer_id,
@@ -751,8 +745,7 @@ class WriteCommandHandlers:
             loan.compliance_status = compliance.status
             loan.validate_application_approval(command.approved_amount_usd)
             decided_events.append(
-                BaseEvent(
-                    event_type="ApplicationApproved",
+                ApplicationApprovedEvent(
                     payload={
                         "application_id": command.application_id,
                         "approved_amount_usd": command.approved_amount_usd,
@@ -770,8 +763,7 @@ class WriteCommandHandlers:
             )
         else:
             decided_events.append(
-                BaseEvent(
-                    event_type="ApplicationDeclined",
+                ApplicationDeclinedEvent(
                     payload={
                         "application_id": command.application_id,
                         "decline_reasons": command.decline_reasons,
@@ -802,8 +794,7 @@ class WriteCommandHandlers:
     ) -> AppendResult:
         # 1) Load
         stream_id = _audit_stream_id(command.entity_type, command.entity_id)
-        events = await self.store.load_stream(stream_id)
-        audit = AuditLedgerAggregate.load(events)
+        audit = await AuditLedgerAggregate.load(self.store, stream_id)
 
         # 2) Validate
         if command.role.lower() not in {"compliance", "admin"}:
@@ -825,8 +816,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         decided_events = [
-            BaseEvent(
-                event_type="AuditIntegrityCheckRun",
+            AuditIntegrityCheckRunEvent(
                 payload=payload,
                 metadata=metadata,
             )

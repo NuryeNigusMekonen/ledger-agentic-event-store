@@ -2,17 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from src.models.events import DomainError, StoredEvent
+from src.models.events import (
+    ApplicationApprovedPayload,
+    ApplicationDeclinedPayload,
+    ApplicationSubmittedPayload,
+    DecisionGeneratedPayload,
+    DomainError,
+    HumanReviewCompletedPayload,
+    StoredEvent,
+)
+
+if TYPE_CHECKING:
+    from src.event_store import EventStore
 
 
 class LoanStatus(StrEnum):
     EMPTY = "EMPTY"
     SUBMITTED = "SUBMITTED"
     AWAITING_ANALYSIS = "AWAITING_ANALYSIS"
-    ANALYSIS_COMPLETE = "ANALYSIS_COMPLETE"
-    COMPLIANCE_REVIEW = "COMPLIANCE_REVIEW"
     PENDING_DECISION = "PENDING_DECISION"
     APPROVED_PENDING_HUMAN = "APPROVED_PENDING_HUMAN"
     DECLINED_PENDING_HUMAN = "DECLINED_PENDING_HUMAN"
@@ -21,6 +30,15 @@ class LoanStatus(StrEnum):
 
 
 TERMINAL_STATUSES = {LoanStatus.FINAL_APPROVED, LoanStatus.FINAL_DECLINED}
+CANONICAL_LOAN_STATES = {
+    LoanStatus.SUBMITTED,
+    LoanStatus.AWAITING_ANALYSIS,
+    LoanStatus.PENDING_DECISION,
+    LoanStatus.APPROVED_PENDING_HUMAN,
+    LoanStatus.DECLINED_PENDING_HUMAN,
+    LoanStatus.FINAL_APPROVED,
+    LoanStatus.FINAL_DECLINED,
+}
 
 
 @dataclass
@@ -37,11 +55,16 @@ class LoanApplicationAggregate:
     _known_agent_sessions: set[str] = field(default_factory=set)
 
     @classmethod
-    def load(cls, events: list[StoredEvent]) -> LoanApplicationAggregate:
+    def replay(cls, events: list[StoredEvent]) -> LoanApplicationAggregate:
         aggregate = cls()
         for event in events:
             aggregate.apply(event)
         return aggregate
+
+    @classmethod
+    async def load(cls, store: EventStore, stream_id: str) -> LoanApplicationAggregate:
+        events = await store.load_stream(stream_id)
+        return cls.replay(events)
 
     @property
     def is_terminal(self) -> bool:
@@ -101,39 +124,48 @@ class LoanApplicationAggregate:
         _ = metadata
 
     def _apply_application_submitted(self, payload: dict[str, Any]) -> None:
-        if self.status != LoanStatus.EMPTY:
-            raise DomainError("ApplicationSubmitted can only occur on an empty aggregate.")
-        requested = float(payload["requested_amount_usd"])
+        self._require_state("ApplicationSubmitted", {LoanStatus.EMPTY})
+        typed = ApplicationSubmittedPayload.model_validate(payload)
+        requested = float(typed.requested_amount_usd)
         if requested <= 0:
             raise DomainError("requested_amount_usd must be greater than zero.")
-        self.application_id = payload["application_id"]
+        self.application_id = typed.application_id
         self.requested_amount_usd = requested
         self.status = LoanStatus.SUBMITTED
 
     def _apply_credit_analysis_requested(self) -> None:
-        self.ensure_mutable()
-        if self.status not in {LoanStatus.SUBMITTED, LoanStatus.AWAITING_ANALYSIS}:
-            raise DomainError(
-                f"CreditAnalysisRequested invalid in current state '{self.status.value}'."
-            )
+        self._require_state(
+            "CreditAnalysisRequested",
+            {LoanStatus.SUBMITTED, LoanStatus.AWAITING_ANALYSIS},
+        )
         self.status = LoanStatus.AWAITING_ANALYSIS
 
     def _apply_decision_generated(self, payload: dict[str, Any]) -> None:
-        self.ensure_mutable()
-        recommendation = str(payload["recommendation"]).upper()
+        self._require_state(
+            "DecisionGenerated",
+            {
+                LoanStatus.AWAITING_ANALYSIS,
+                LoanStatus.PENDING_DECISION,
+                LoanStatus.APPROVED_PENDING_HUMAN,
+                LoanStatus.DECLINED_PENDING_HUMAN,
+            },
+        )
+        typed = DecisionGeneratedPayload.model_validate(payload)
+        recommendation = typed.recommendation.upper()
         if recommendation not in {"APPROVE", "DECLINE", "REFER"}:
             raise DomainError(
                 "DecisionGenerated recommendation must be APPROVE, DECLINE, or REFER."
             )
 
         self.decision_recommendation = recommendation
-        self.compliance_status = str(payload.get("compliance_status", self.compliance_status))
+        if typed.compliance_status is not None:
+            self.compliance_status = typed.compliance_status
 
-        assessed_max = payload.get("assessed_max_limit_usd")
+        assessed_max = typed.assessed_max_limit_usd
         if assessed_max is not None:
             self.assessed_max_limit_usd = float(assessed_max)
 
-        sessions = payload.get("contributing_agent_sessions", [])
+        sessions = typed.contributing_agent_sessions
         for session_ref in sessions:
             self._known_agent_sessions.add(str(session_ref))
 
@@ -145,36 +177,59 @@ class LoanApplicationAggregate:
             self.status = LoanStatus.PENDING_DECISION
 
     def _apply_human_review_completed(self, payload: dict[str, Any]) -> None:
-        self.ensure_mutable()
-        if self.status not in {
-            LoanStatus.APPROVED_PENDING_HUMAN,
-            LoanStatus.DECLINED_PENDING_HUMAN,
-            LoanStatus.PENDING_DECISION,
-        }:
-            raise DomainError(
-                f"HumanReviewCompleted invalid in current state '{self.status.value}'."
-            )
+        self._require_state(
+            "HumanReviewCompleted",
+            {
+                LoanStatus.APPROVED_PENDING_HUMAN,
+                LoanStatus.DECLINED_PENDING_HUMAN,
+                LoanStatus.PENDING_DECISION,
+            },
+        )
+        typed = HumanReviewCompletedPayload.model_validate(payload)
 
-        override = bool(payload.get("override", False))
-        if override and not payload.get("override_reason"):
+        if typed.override and not typed.override_reason:
             raise DomainError("override_reason is required when override=True.")
 
-        self.final_decision = str(payload["final_decision"]).upper()
+        self.final_decision = typed.final_decision.upper()
         self._seen_review_event = True
 
     def _apply_application_approved(self, payload: dict[str, Any]) -> None:
-        self.ensure_mutable()
+        self._require_state(
+            "ApplicationApproved",
+            {
+                LoanStatus.APPROVED_PENDING_HUMAN,
+                LoanStatus.DECLINED_PENDING_HUMAN,
+                LoanStatus.PENDING_DECISION,
+            },
+        )
+        typed = ApplicationApprovedPayload.model_validate(payload)
         if not self._seen_review_event:
             raise DomainError("ApplicationApproved requires a prior HumanReviewCompleted event.")
-        approved_amount = float(payload["approved_amount_usd"])
+        approved_amount = float(typed.approved_amount_usd)
         self.validate_application_approval(approved_amount)
         self.final_decision = "APPROVE"
         self.status = LoanStatus.FINAL_APPROVED
 
     def _apply_application_declined(self, payload: dict[str, Any]) -> None:
-        self.ensure_mutable()
+        self._require_state(
+            "ApplicationDeclined",
+            {
+                LoanStatus.APPROVED_PENDING_HUMAN,
+                LoanStatus.DECLINED_PENDING_HUMAN,
+                LoanStatus.PENDING_DECISION,
+            },
+        )
+        typed = ApplicationDeclinedPayload.model_validate(payload)
         if not self._seen_review_event:
             raise DomainError("ApplicationDeclined requires a prior HumanReviewCompleted event.")
-        _ = payload
+        _ = typed
         self.final_decision = "DECLINE"
         self.status = LoanStatus.FINAL_DECLINED
+
+    def _require_state(self, event_name: str, allowed: set[LoanStatus]) -> None:
+        if self.status not in allowed:
+            allowed_states = ", ".join(sorted(state.value for state in allowed))
+            raise DomainError(
+                f"{event_name} invalid in current state '{self.status.value}'. "
+                f"Allowed: {allowed_states}."
+            )

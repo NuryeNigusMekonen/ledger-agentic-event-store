@@ -9,7 +9,15 @@ import pytest_asyncio
 from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
-from src.models.events import BaseEvent
+from src.models.events import (
+    AgentContextLoadedEvent,
+    ApplicationApprovedEvent,
+    ApplicationDeclinedEvent,
+    ApplicationSubmittedEvent,
+    CreditAnalysisCompletedEvent,
+    DecisionGeneratedEvent,
+    HumanReviewCompletedEvent,
+)
 from src.what_if.projector import run_what_if
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -69,8 +77,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
         aggregate_type="LoanApplication",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="ApplicationSubmitted",
+            ApplicationSubmittedEvent(
                 payload={"application_id": app_id, "requested_amount_usd": 10000},
                 metadata={"correlation_id": "corr-1"},
             )
@@ -81,8 +88,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
         aggregate_type="AgentSession",
         expected_version=0,
         events=[
-            BaseEvent(
-                event_type="AgentContextLoaded",
+            AgentContextLoadedEvent(
                 payload={
                     "agent_id": "credit-agent-1",
                     "session_id": "session-1",
@@ -93,9 +99,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
                 },
                 metadata={"correlation_id": "corr-1"},
             ),
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "agent_id": "credit-agent-1",
@@ -118,9 +122,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
         aggregate_type="LoanApplication",
         expected_version=1,
         events=[
-            BaseEvent(
-                event_type="DecisionGenerated",
-                event_version=2,
+            DecisionGeneratedEvent(
                 payload={
                     "application_id": app_id,
                     "orchestrator_agent_id": "orchestrator-1",
@@ -146,8 +148,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
         aggregate_type="LoanApplication",
         expected_version=2,
         events=[
-            BaseEvent(
-                event_type="HumanReviewCompleted",
+            HumanReviewCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "reviewer_id": "human-1",
@@ -159,8 +160,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
                     "causation_id": decision_event_id,
                 },
             ),
-            BaseEvent(
-                event_type="ApplicationApproved",
+            ApplicationApprovedEvent(
                 payload={
                     "application_id": app_id,
                     "approved_amount_usd": 9000,
@@ -183,9 +183,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
         application_id=app_id,
         branch_at_event_type="CreditAnalysisCompleted",
         counterfactual_events=[
-            BaseEvent(
-                event_type="CreditAnalysisCompleted",
-                event_version=2,
+            CreditAnalysisCompletedEvent(
                 payload={
                     "application_id": app_id,
                     "agent_id": "credit-agent-1",
@@ -199,9 +197,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
                 },
                 metadata={},
             ),
-            BaseEvent(
-                event_type="DecisionGenerated",
-                event_version=2,
+            DecisionGeneratedEvent(
                 payload={
                     "application_id": app_id,
                     "orchestrator_agent_id": "orchestrator-1",
@@ -215,8 +211,7 @@ async def test_run_what_if_produces_materially_different_outcome(store: EventSto
                 },
                 metadata={"stream_id_override": loan_stream},
             ),
-            BaseEvent(
-                event_type="ApplicationDeclined",
+            ApplicationDeclinedEvent(
                 payload={
                     "application_id": app_id,
                     "decline_reasons": ["counterfactual high risk"],
