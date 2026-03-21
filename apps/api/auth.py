@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,12 +23,39 @@ COMMAND_ROLE_POLICY: dict[str, set[str]] = {
 }
 
 
-DEFAULT_DEMO_USERS: list[tuple[str, str, str]] = [
+LEGACY_PLATFORM_USERS: list[tuple[str, str, str]] = [
     ("analyst", "analyst123!", "analyst"),
     ("compliance", "compliance123!", "compliance"),
     ("ops", "ops123!", "ops"),
     ("admin", "admin123!", "admin"),
 ]
+
+
+def configured_seed_users() -> list[tuple[str, str, str]]:
+    analyst_one_username = (
+        os.getenv("LEDGER_ANALYST_ONE_USERNAME")
+        or os.getenv("LEDGER_ANALYST_USERNAME", "melat")
+    ).strip() or "melat"
+    analyst_one_password = (
+        os.getenv("LEDGER_ANALYST_ONE_PASSWORD")
+        or os.getenv("LEDGER_ANALYST_PASSWORD", "melat@123")
+    )
+    analyst_two_username = os.getenv("LEDGER_ANALYST_TWO_USERNAME", "kedir").strip() or "kedir"
+    analyst_two_password = os.getenv("LEDGER_ANALYST_TWO_PASSWORD", "kedir@123")
+    admin_username = os.getenv("LEDGER_ADMIN_USERNAME", "nurye").strip() or "nurye"
+    admin_password = os.getenv("LEDGER_ADMIN_PASSWORD", "nurye@123")
+
+    users: list[tuple[str, str, str]] = [
+        *LEGACY_PLATFORM_USERS,
+        (analyst_one_username, analyst_one_password, "analyst"),
+        (analyst_two_username, analyst_two_password, "analyst"),
+        (admin_username, admin_password, "admin"),
+    ]
+
+    deduped: dict[str, tuple[str, str, str]] = {}
+    for username, password, role in users:
+        deduped[username] = (username, password, role)
+    return list(deduped.values())
 
 
 @dataclass(slots=True)
