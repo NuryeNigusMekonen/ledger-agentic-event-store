@@ -50,9 +50,17 @@ class LoanApplicationAggregate:
     def can_submit(self) -> bool:
         return self.status == LoanStatus.EMPTY
 
+    def ensure_exists(self, application_id: str) -> None:
+        if self.status == LoanStatus.EMPTY:
+            raise DomainError(f"Loan application '{application_id}' does not exist.")
+
     def ensure_mutable(self) -> None:
         if self.is_terminal:
             raise DomainError(f"Loan '{self.application_id}' is already final: {self.status}.")
+
+    def ensure_can_record_agent_analysis(self, application_id: str) -> None:
+        self.ensure_exists(application_id)
+        self.ensure_mutable()
 
     def apply(self, event: StoredEvent) -> None:
         self._apply(event.event_type, event.payload, event.metadata)
