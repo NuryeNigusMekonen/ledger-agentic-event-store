@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import asyncpg
 
@@ -83,11 +83,14 @@ class EventStore:
         expected_version: int,
         stream_metadata: dict[str, Any] | None = None,
         outbox_topic: str | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> AppendResult:
         if not events:
             raise DomainError("append() requires at least one event.")
 
         metadata_patch = stream_metadata or {}
+        effective_outbox_topic = outbox_topic or f"{aggregate_type}.events"
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 stream_row = await conn.fetchrow(
@@ -142,6 +145,11 @@ class EventStore:
                 inserted_events: list[StoredEvent] = []
                 for offset, event in enumerate(events, start=1):
                     stream_position = current_version + offset
+                    event_metadata = _event_metadata_with_lineage(
+                        metadata=event.metadata,
+                        correlation_id=correlation_id,
+                        causation_id=causation_id,
+                    )
                     row = await conn.fetchrow(
                         """
                         INSERT INTO events (
@@ -169,30 +177,33 @@ class EventStore:
                         event.event_type,
                         event.event_version,
                         event.payload,
-                        event.metadata,
+                        event_metadata,
                     )
                     inserted = _row_to_stored_event(row)
                     inserted_events.append(inserted)
 
-                    if outbox_topic:
-                        await conn.execute(
-                            """
-                            INSERT INTO outbox (event_id, topic, payload, headers)
-                            VALUES ($1, $2, $3::jsonb, $4::jsonb)
-                            """,
-                            inserted.event_id,
-                            outbox_topic,
-                            {
-                                "event_id": str(inserted.event_id),
-                                "stream_id": stream_id,
-                                "event_type": inserted.event_type,
-                                "event_version": inserted.event_version,
-                                "payload": inserted.payload,
-                                "metadata": inserted.metadata,
-                                "recorded_at": inserted.recorded_at.isoformat(),
-                            },
-                            {"aggregate_type": aggregate_type},
-                        )
+                    await conn.execute(
+                        """
+                        INSERT INTO outbox (event_id, topic, payload, headers)
+                        VALUES ($1, $2, $3::jsonb, $4::jsonb)
+                        """,
+                        inserted.event_id,
+                        effective_outbox_topic,
+                        {
+                            "event_id": str(inserted.event_id),
+                            "stream_id": stream_id,
+                            "event_type": inserted.event_type,
+                            "event_version": inserted.event_version,
+                            "payload": inserted.payload,
+                            "metadata": inserted.metadata,
+                            "recorded_at": inserted.recorded_at.isoformat(),
+                        },
+                        {
+                            "aggregate_type": aggregate_type,
+                            "correlation_id": correlation_id,
+                            "causation_id": causation_id,
+                        },
+                    )
 
                 new_stream_version = current_version + len(events)
                 await conn.execute(
@@ -271,94 +282,78 @@ class EventStore:
         self,
         from_global_position: int = 0,
         limit: int | None = None,
+        batch_size: int = 500,
         event_type: str | None = None,
-    ) -> list[StoredEvent]:
-        if event_type is not None and limit is not None:
-            rows = await self._pool.fetch(
-                """
-                SELECT
-                  event_id,
-                  stream_id,
-                  stream_position,
-                  global_position,
-                  event_type,
-                  event_version,
-                  payload,
-                  metadata,
-                  recorded_at
-                FROM events
-                WHERE global_position > $1 AND event_type = $2
-                ORDER BY global_position ASC
-                LIMIT $3
-                """,
-                from_global_position,
-                event_type,
-                limit,
-            )
-        elif event_type is not None:
-            rows = await self._pool.fetch(
-                """
-                SELECT
-                  event_id,
-                  stream_id,
-                  stream_position,
-                  global_position,
-                  event_type,
-                  event_version,
-                  payload,
-                  metadata,
-                  recorded_at
-                FROM events
-                WHERE global_position > $1 AND event_type = $2
-                ORDER BY global_position ASC
-                """,
-                from_global_position,
-                event_type,
-            )
-        elif limit is not None:
-            rows = await self._pool.fetch(
-                """
-                SELECT
-                  event_id,
-                  stream_id,
-                  stream_position,
-                  global_position,
-                  event_type,
-                  event_version,
-                  payload,
-                  metadata,
-                  recorded_at
-                FROM events
-                WHERE global_position > $1
-                ORDER BY global_position ASC
-                LIMIT $2
-                """,
-                from_global_position,
-                limit,
-            )
-        else:
-            rows = await self._pool.fetch(
-                """
-                SELECT
-                  event_id,
-                  stream_id,
-                  stream_position,
-                  global_position,
-                  event_type,
-                  event_version,
-                  payload,
-                  metadata,
-                  recorded_at
-                FROM events
-                WHERE global_position > $1
-                ORDER BY global_position ASC
-                """,
-                from_global_position,
-            )
-        return [
-            _row_to_stored_event(row, registry=self._upcaster_registry)
-            for row in rows
-        ]
+    ) -> AsyncIterator[list[StoredEvent]]:
+        if batch_size <= 0:
+            raise DomainError("load_all() requires batch_size > 0.")
+
+        cursor = from_global_position
+        remaining = limit
+
+        while True:
+            fetch_limit = batch_size if remaining is None else min(batch_size, remaining)
+            if fetch_limit <= 0:
+                break
+
+            if event_type is None:
+                rows = await self._pool.fetch(
+                    """
+                    SELECT
+                      event_id,
+                      stream_id,
+                      stream_position,
+                      global_position,
+                      event_type,
+                      event_version,
+                      payload,
+                      metadata,
+                      recorded_at
+                    FROM events
+                    WHERE global_position > $1
+                    ORDER BY global_position ASC
+                    LIMIT $2
+                    """,
+                    cursor,
+                    fetch_limit,
+                )
+            else:
+                rows = await self._pool.fetch(
+                    """
+                    SELECT
+                      event_id,
+                      stream_id,
+                      stream_position,
+                      global_position,
+                      event_type,
+                      event_version,
+                      payload,
+                      metadata,
+                      recorded_at
+                    FROM events
+                    WHERE global_position > $1 AND event_type = $2
+                    ORDER BY global_position ASC
+                    LIMIT $3
+                    """,
+                    cursor,
+                    event_type,
+                    fetch_limit,
+                )
+
+            if not rows:
+                break
+
+            batch = [
+                _row_to_stored_event(row, registry=self._upcaster_registry)
+                for row in rows
+            ]
+            yield batch
+
+            cursor = batch[-1].global_position
+            if remaining is not None:
+                remaining -= len(batch)
+                if remaining <= 0:
+                    break
 
     async def stream_version(self, stream_id: str) -> int:
         row = await self._pool.fetchrow(
@@ -506,3 +501,16 @@ def _row_to_stream_metadata(row: asyncpg.Record) -> StreamMetadata:
         archived_at=row["archived_at"],
         metadata=dict(row["metadata"]),
     )
+
+
+def _event_metadata_with_lineage(
+    metadata: dict[str, Any],
+    correlation_id: str | None,
+    causation_id: str | None,
+) -> dict[str, Any]:
+    enriched = dict(metadata)
+    if correlation_id is not None:
+        enriched["correlation_id"] = correlation_id
+    if causation_id is not None:
+        enriched["causation_id"] = causation_id
+    return enriched
