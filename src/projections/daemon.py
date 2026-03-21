@@ -168,16 +168,15 @@ class ProjectionDaemon:
 
     async def _run_projection_batch(self, projection: Projection) -> int:
         checkpoint = await self._checkpoint_position(projection.name)
-        events = await self.store.load_all(
+        async for events in self.store.load_all(
             from_global_position=checkpoint,
             limit=self.batch_size,
-        )
-        if not events:
-            return 0
-
-        for event in events:
-            await self._apply_event_with_retry(projection=projection, event=event)
-        return len(events)
+            batch_size=self.batch_size,
+        ):
+            for event in events:
+                await self._apply_event_with_retry(projection=projection, event=event)
+            return len(events)
+        return 0
 
     async def _apply_event_with_retry(self, projection: Projection, event) -> None:
         attempt = 0
@@ -257,4 +256,3 @@ class ProjectionDaemon:
             global_position,
             event_time,
         )
-
