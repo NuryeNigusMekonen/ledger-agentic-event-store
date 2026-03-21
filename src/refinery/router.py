@@ -25,6 +25,8 @@ class ExtractionRouter:
         vision_budget_usd: float = 1.5,
         gemini_api_key: str | None = None,
         gemini_model: str | None = None,
+        openai_api_key: str | None = None,
+        openai_model: str | None = None,
     ) -> None:
         self.rules = _load_rules(Path(rules_path))
         self.ledger_path = Path(ledger_path)
@@ -36,6 +38,8 @@ class ExtractionRouter:
             max_cost_usd=vision_budget_usd,
             gemini_api_key=gemini_api_key,
             gemini_model=gemini_model,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
         )
 
     def extract(self, document_path: str | Path, profile: DocumentProfile) -> RoutedExtraction:

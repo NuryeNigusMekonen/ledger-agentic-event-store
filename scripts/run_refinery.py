@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -26,14 +25,26 @@ def main() -> None:
     parser.add_argument(
         "--gemini-api-key",
         type=str,
-        default=os.getenv("GEMINI_API_KEY"),
-        help="Optional Gemini API key. Falls back to GEMINI_API_KEY env var.",
+        default=None,
+        help="Optional Gemini API key. Falls back to GEMINI_API_KEY env var when omitted.",
     )
     parser.add_argument(
         "--gemini-model",
         type=str,
-        default=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-        help="Gemini model name used by vision strategy when API key is present.",
+        default=None,
+        help="Gemini model name. Falls back to GEMINI_MODEL env var when omitted.",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help="Optional OpenAI API key fallback. Falls back to OPENAI_API_KEY env var when omitted.",
+    )
+    parser.add_argument(
+        "--openai-model",
+        type=str,
+        default=None,
+        help="OpenAI model name for fallback refinement. Falls back to OPENAI_MODEL env var when omitted.",
     )
     args = parser.parse_args()
 
@@ -41,6 +52,8 @@ def main() -> None:
         sqlite_db_path=args.db,
         gemini_api_key=args.gemini_api_key,
         gemini_model=args.gemini_model,
+        openai_api_key=args.openai_api_key,
+        openai_model=args.openai_model,
     )
     result = pipeline.run(args.document)
 
@@ -50,6 +63,7 @@ def main() -> None:
             "strategy": result.extracted.strategy_used,
             "confidence": result.extracted.confidence_score,
             "gemini_status": result.extracted.metadata.get("gemini_status", "unknown"),
+            "openai_status": result.extracted.metadata.get("openai_status", "unknown"),
             "chunks": len(result.chunks),
             "facts": result.facts_count,
             "page_index_children": len(result.page_index.root.child_sections),
