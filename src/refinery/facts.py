@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib import error, request
 
 from src.refinery.models import LDU
 
@@ -50,6 +54,166 @@ class FinancialFactExtractor:
                     )
                 )
         return facts
+
+
+class LLMFinancialFactExtractor:
+    METRIC_KEYS = (
+        "total_revenue",
+        "net_income",
+        "ebitda",
+        "total_assets",
+        "total_liabilities",
+    )
+
+    def __init__(
+        self,
+        *,
+        gemini_api_key: str | None = None,
+        gemini_model: str | None = None,
+        openai_api_key: str | None = None,
+        openai_model: str | None = None,
+        timeout_seconds: float = 12.0,
+    ) -> None:
+        resolved_gemini_key = os.getenv("GEMINI_API_KEY", "") if gemini_api_key is None else gemini_api_key
+        resolved_gemini_model = (
+            os.getenv("GEMINI_MODEL", "gemini-2.0-flash") if gemini_model is None else gemini_model
+        )
+        resolved_openai_key = os.getenv("OPENAI_API_KEY", "") if openai_api_key is None else openai_api_key
+        resolved_openai_model = (
+            os.getenv("OPENAI_MODEL", "gpt-4o-mini") if openai_model is None else openai_model
+        )
+
+        self.gemini_api_key = resolved_gemini_key.strip()
+        self.gemini_model = resolved_gemini_model.strip()
+        self.openai_api_key = resolved_openai_key.strip()
+        self.openai_model = resolved_openai_model.strip()
+        self.timeout_seconds = timeout_seconds
+
+    def extract(self, raw_text: str) -> tuple[dict[str, float | None], str | None]:
+        blank = {metric: None for metric in self.METRIC_KEYS}
+        snippet = raw_text.strip()[:12000]
+        if not snippet:
+            return blank, None
+
+        if self.gemini_api_key:
+            gemini_result = self._extract_with_gemini(snippet)
+            if gemini_result is not None and any(value is not None for value in gemini_result.values()):
+                return gemini_result, "gemini"
+
+        if self.openai_api_key:
+            openai_result = self._extract_with_openai(snippet)
+            if openai_result is not None and any(value is not None for value in openai_result.values()):
+                return openai_result, "openai"
+
+        return blank, None
+
+    def _extract_with_gemini(self, snippet: str) -> dict[str, float | None] | None:
+        prompt = (
+            "Extract these financial metrics from the text and return strict JSON with keys:\n"
+            "total_revenue, net_income, ebitda, total_assets, total_liabilities.\n"
+            "Use numeric values only (no commas, no currency symbols), or null when missing."
+        )
+        payload = {
+            "contents": [
+                {"parts": [{"text": prompt}, {"text": f"DOCUMENT_TEXT:\n{snippet}"}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 256,
+                "responseMimeType": "application/json",
+            },
+        }
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        )
+        req = request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except (TimeoutError, error.HTTPError, error.URLError, OSError):
+            return None
+
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+
+        candidate = _extract_gemini_candidate_text(parsed)
+        if not candidate:
+            return None
+        obj = _load_first_json_object(candidate)
+        if not isinstance(obj, dict):
+            return None
+        return _normalize_metric_payload(obj, self.METRIC_KEYS)
+
+    def _extract_with_openai(self, snippet: str) -> dict[str, float | None] | None:
+        prompt = (
+            "Extract these financial metrics from the text and return strict JSON with keys:\n"
+            "total_revenue, net_income, ebitda, total_assets, total_liabilities.\n"
+            "Use numeric values only (no commas, no currency symbols), or null when missing."
+        )
+        payload = {
+            "model": self.openai_model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"DOCUMENT_TEXT:\n{snippet}"},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 256,
+            "response_format": {"type": "json_object"},
+        }
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.openai_api_key}",
+        }
+
+        req = request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            if exc.code != 400:
+                return None
+            retry_payload = dict(payload)
+            retry_payload.pop("response_format", None)
+            retry_req = request.Request(
+                endpoint,
+                data=json.dumps(retry_payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with request.urlopen(retry_req, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8")
+            except (TimeoutError, error.HTTPError, error.URLError, OSError):
+                return None
+        except (TimeoutError, error.URLError, OSError):
+            return None
+
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+
+        candidate = _extract_openai_candidate_text(parsed)
+        if not candidate:
+            return None
+        obj = _load_first_json_object(candidate)
+        if not isinstance(obj, dict):
+            return None
+        return _normalize_metric_payload(obj, self.METRIC_KEYS)
 
 
 class SQLiteFactStore:
@@ -117,3 +281,128 @@ class SQLiteFactStore:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql).fetchall()
         return [dict(row) for row in rows]
+
+
+def _extract_gemini_candidate_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                return str(part["text"])
+    return ""
+
+
+def _extract_openai_candidate_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                chunks.append(str(item["text"]))
+        return "\n".join(chunks)
+    return ""
+
+
+def _load_first_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        cleaned = cleaned.replace("json", "", 1).strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        obj = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _normalize_metric_payload(
+    payload: dict[str, Any],
+    metric_keys: tuple[str, ...],
+) -> dict[str, float | None]:
+    normalized_payload = {
+        _normalize_key(str(key)): value for key, value in payload.items()
+    }
+    aliases = {
+        "total_revenue": ("totalrevenue", "revenue"),
+        "net_income": ("netincome", "netprofit", "profitaftertax"),
+        "ebitda": ("ebitda",),
+        "total_assets": ("totalassets", "assets"),
+        "total_liabilities": ("totalliabilities", "totalliability", "liabilities"),
+    }
+
+    output: dict[str, float | None] = {}
+    for metric in metric_keys:
+        aliases_for_metric = aliases.get(metric, (_normalize_key(metric),))
+        raw_value: Any = None
+        for alias in aliases_for_metric:
+            if alias in normalized_payload:
+                raw_value = normalized_payload[alias]
+                break
+        output[metric] = _coerce_metric_value(raw_value)
+    return output
+
+
+def _normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def _coerce_metric_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip().lower()
+    if raw in {"", "null", "none", "n/a", "na"}:
+        return None
+
+    negative = raw.startswith("(") and raw.endswith(")")
+    if negative:
+        raw = raw[1:-1]
+
+    multiplier = 1.0
+    if "billion" in raw or raw.endswith("bn"):
+        multiplier = 1_000_000_000.0
+    elif "million" in raw or raw.endswith("mn") or raw.endswith("m"):
+        multiplier = 1_000_000.0
+    elif "thousand" in raw or raw.endswith("k"):
+        multiplier = 1_000.0
+
+    numeric = re.sub(r"[^0-9.\-]", "", raw)
+    if not numeric:
+        return None
+
+    try:
+        parsed = float(numeric) * multiplier
+    except ValueError:
+        return None
+    return -parsed if negative else parsed
