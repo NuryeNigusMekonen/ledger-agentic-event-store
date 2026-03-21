@@ -9,7 +9,8 @@ challenge/
 
 # Local project PostgreSQL instance (data, socket, logs)
 .local/postgres/
-
+docs/
+report/
 # Generated artifacts
 tmp/
 *.log
@@ -29,3 +30,4 @@ apps/web/.env
 .idea/
 .DS_Store
 apps/web/tsconfig.app.tsbuildinfo
+apps/web/logo/
