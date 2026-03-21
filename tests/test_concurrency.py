@@ -79,6 +79,8 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
             aggregate_type="LoanApplication",
             events=[BaseEvent(event_type="DecisionGenerated", payload={"agent": label})],
             expected_version=3,
+            correlation_id="corr-concurrency-race",
+            causation_id="cause-concurrency-race",
         )
 
     task_a = asyncio.create_task(attempt("agent-a"))
@@ -101,4 +103,6 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
     events = await store.load_stream(stream_id)
     assert len(events) == 4
     assert [event.stream_position for event in events] == [1, 2, 3, 4]
+    assert events[-1].metadata["correlation_id"] == "corr-concurrency-race"
+    assert events[-1].metadata["causation_id"] == "cause-concurrency-race"
     assert await store.stream_version(stream_id) == 4
