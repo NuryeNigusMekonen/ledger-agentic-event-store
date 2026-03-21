@@ -35,6 +35,7 @@ class SubmitApplicationInput(BaseModel):
     document_path: str | None = None
     process_documents_after_submit: bool = False
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class StartAgentSessionInput(BaseModel):
@@ -47,6 +48,7 @@ class StartAgentSessionInput(BaseModel):
     context_token_count: int = Field(gt=0)
     model_version: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class RecordCreditAnalysisInput(BaseModel):
@@ -62,6 +64,7 @@ class RecordCreditAnalysisInput(BaseModel):
     analysis_duration_ms: int = Field(ge=0)
     input_data_hash: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class RecordFraudScreeningInput(BaseModel):
@@ -75,6 +78,7 @@ class RecordFraudScreeningInput(BaseModel):
     screening_model_version: str
     input_data_hash: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class RecordComplianceCheckInput(BaseModel):
@@ -89,6 +93,7 @@ class RecordComplianceCheckInput(BaseModel):
     failure_reason: str | None = None
     remediation_required: bool = False
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class GenerateDecisionInput(BaseModel):
@@ -102,6 +107,7 @@ class GenerateDecisionInput(BaseModel):
     contributing_agent_sessions: list[str]
     model_versions: dict[str, str]
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class RecordHumanReviewInput(BaseModel):
@@ -118,6 +124,7 @@ class RecordHumanReviewInput(BaseModel):
     effective_date: str | None = None
     decline_reasons: list[str] = Field(default_factory=list)
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class RunIntegrityCheckInput(BaseModel):
@@ -127,6 +134,7 @@ class RunIntegrityCheckInput(BaseModel):
     entity_id: str
     role: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 class LedgerMCPTools:
@@ -206,7 +214,7 @@ class LedgerMCPTools:
                 "name": "run_integrity_check",
                 "description": (
                     "Run SHA-256 audit chain verification and append AuditIntegrityCheckRun. "
-                    "Precondition: role must be compliance; rate limit 1/minute/entity."
+                    "Precondition: role must be compliance or admin; rate limit 1/minute/entity."
                 ),
                 "input_schema": RunIntegrityCheckInput.model_json_schema(),
             },
@@ -286,6 +294,7 @@ class LedgerMCPTools:
                 document_path=params.document_path,
                 process_documents_after_submit=params.process_documents_after_submit,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -308,6 +317,7 @@ class LedgerMCPTools:
                 context_token_count=params.context_token_count,
                 model_version=params.model_version,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -344,6 +354,7 @@ class LedgerMCPTools:
                 analysis_duration_ms=params.analysis_duration_ms,
                 input_data_hash=params.input_data_hash,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -377,6 +388,7 @@ class LedgerMCPTools:
                 screening_model_version=params.screening_model_version,
                 input_data_hash=params.input_data_hash,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -411,6 +423,7 @@ class LedgerMCPTools:
                 failure_reason=params.failure_reason,
                 remediation_required=params.remediation_required,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -459,6 +472,7 @@ class LedgerMCPTools:
                 contributing_agent_sessions=params.contributing_agent_sessions,
                 model_versions=params.model_versions,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -492,6 +506,7 @@ class LedgerMCPTools:
                 effective_date=params.effective_date,
                 decline_reasons=params.decline_reasons,
                 correlation_id=params.correlation_id,
+                causation_id=params.causation_id,
             )
         )
         await self._after_write()
@@ -505,11 +520,11 @@ class LedgerMCPTools:
 
     async def run_integrity_check(self, arguments: dict[str, Any]) -> dict[str, Any]:
         params = RunIntegrityCheckInput.model_validate(arguments)
-        if params.role.lower() != "compliance":
+        if params.role.lower() not in {"compliance", "admin"}:
             return _error(
                 error_type="AuthorizationError",
-                message="run_integrity_check requires compliance role.",
-                suggested_action="use_compliance_role_credentials",
+                message="run_integrity_check requires compliance or admin role.",
+                suggested_action="use_admin_or_compliance_credentials",
             )
 
         entity_key = f"{params.entity_type}:{params.entity_id}"
@@ -542,7 +557,7 @@ class LedgerMCPTools:
                 previous_hash=previous_hash,
                 role=params.role,
                 correlation_id=params.correlation_id,
-                causation_id=None,
+                causation_id=params.causation_id,
             )
         )
         self._integrity_rate_limit[entity_key] = now
