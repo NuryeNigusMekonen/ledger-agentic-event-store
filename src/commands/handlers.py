@@ -25,6 +25,7 @@ class SubmitApplicationCommand:
     document_path: str | None = None
     process_documents_after_submit: bool = False
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -36,6 +37,7 @@ class StartAgentSessionCommand:
     context_token_count: int
     model_version: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -50,6 +52,7 @@ class CreditAnalysisCompletedCommand:
     analysis_duration_ms: int
     input_data_hash: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +65,7 @@ class FraudScreeningCompletedCommand:
     screening_model_version: str
     input_data_hash: str
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -75,6 +79,7 @@ class ComplianceCheckCommand:
     failure_reason: str | None = None
     remediation_required: bool = False
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -87,6 +92,7 @@ class GenerateDecisionCommand:
     contributing_agent_sessions: list[str]
     model_versions: dict[str, str]
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -102,6 +108,7 @@ class HumanReviewCompletedCommand:
     effective_date: str | None = None
     decline_reasons: list[str] = field(default_factory=list)
     correlation_id: str | None = None
+    causation_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -144,6 +151,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events: list[BaseEvent] = [
             BaseEvent(
                 event_type="ApplicationSubmitted",
@@ -155,7 +163,11 @@ class WriteCommandHandlers:
                     "submission_channel": command.submission_channel,
                     "submitted_at": command.submitted_at.isoformat(),
                 },
-                metadata=_metadata(correlation_id, actor_id=command.applicant_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.applicant_id,
+                ),
             )
         ]
         if not command.process_documents_after_submit:
@@ -170,6 +182,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(
                         correlation_id,
+                        causation_id=causation_id,
                         actor_id=command.applicant_id,
                     ),
                 )
@@ -182,6 +195,8 @@ class WriteCommandHandlers:
             events=decided_events,
             expected_version=loan.version,
             stream_metadata={"application_id": command.application_id},
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
         if not command.process_documents_after_submit:
             return submit_result
@@ -190,6 +205,7 @@ class WriteCommandHandlers:
             application_id=command.application_id,
             document_path=command.document_path or "",
             correlation_id=correlation_id,
+            causation_id=causation_id,
         )
         package_causation = (
             str(package_result.events[-1].event_id) if package_result.events else None
@@ -216,6 +232,8 @@ class WriteCommandHandlers:
                 )
             ],
             expected_version=submit_result.new_stream_version,
+            correlation_id=correlation_id,
+            causation_id=package_causation or causation_id,
         )
 
     async def _append_document_package_events(
@@ -224,6 +242,7 @@ class WriteCommandHandlers:
         application_id: str,
         document_path: str,
         correlation_id: str,
+        causation_id: str | None,
     ) -> AppendResult:
         doc_stream_id = _docpkg_stream_id(application_id)
         current_doc_events = await self.store.load_stream(doc_stream_id)
@@ -359,6 +378,8 @@ class WriteCommandHandlers:
             events=events,
             expected_version=current_version,
             stream_metadata={"application_id": application_id},
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_start_agent_session(self, command: StartAgentSessionCommand) -> AppendResult:
@@ -375,6 +396,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events = [
             BaseEvent(
                 event_type="AgentContextLoaded",
@@ -386,7 +408,11 @@ class WriteCommandHandlers:
                     "context_token_count": command.context_token_count,
                     "model_version": command.model_version,
                 },
-                metadata=_metadata(correlation_id, actor_id=command.agent_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.agent_id,
+                ),
             )
         ]
 
@@ -400,6 +426,8 @@ class WriteCommandHandlers:
                 "agent_id": command.agent_id,
                 "session_id": command.session_id,
             },
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_credit_analysis_completed(
@@ -416,20 +444,18 @@ class WriteCommandHandlers:
         loan = LoanApplicationAggregate.load(loan_events)
 
         # 2) Validate
-        if loan.status == LoanStatus.EMPTY:
-            raise DomainError(f"Loan application '{command.application_id}' does not exist.")
-        loan.ensure_mutable()
-        if not (0.0 <= command.confidence_score <= 1.0):
-            raise DomainError("confidence_score must be between 0.0 and 1.0.")
-        if command.recommended_limit_usd <= 0:
-            raise DomainError("recommended_limit_usd must be > 0.")
-        session.ensure_ready_for_output(
-            event_type="CreditAnalysisCompleted",
+        loan.ensure_can_record_agent_analysis(command.application_id)
+        session.validate_credit_analysis_submission(
             model_version=command.model_version,
+            confidence_score=command.confidence_score,
+            recommended_limit_usd=command.recommended_limit_usd,
+            analysis_duration_ms=command.analysis_duration_ms,
+            input_data_hash=command.input_data_hash,
         )
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events = [
             BaseEvent(
                 event_type="CreditAnalysisCompleted",
@@ -445,7 +471,11 @@ class WriteCommandHandlers:
                     "analysis_duration_ms": command.analysis_duration_ms,
                     "input_data_hash": command.input_data_hash,
                 },
-                metadata=_metadata(correlation_id, actor_id=command.agent_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.agent_id,
+                ),
             )
         ]
 
@@ -455,6 +485,8 @@ class WriteCommandHandlers:
             aggregate_type="AgentSession",
             events=decided_events,
             expected_version=session.version,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_fraud_screening_completed(
@@ -471,18 +503,16 @@ class WriteCommandHandlers:
         loan = LoanApplicationAggregate.load(loan_events)
 
         # 2) Validate
-        if loan.status == LoanStatus.EMPTY:
-            raise DomainError(f"Loan application '{command.application_id}' does not exist.")
-        loan.ensure_mutable()
-        if not (0.0 <= command.fraud_score <= 1.0):
-            raise DomainError("fraud_score must be between 0.0 and 1.0.")
-        session.ensure_ready_for_output(
-            event_type="FraudScreeningCompleted",
-            model_version=command.screening_model_version,
+        loan.ensure_can_record_agent_analysis(command.application_id)
+        session.validate_fraud_screening_submission(
+            screening_model_version=command.screening_model_version,
+            fraud_score=command.fraud_score,
+            input_data_hash=command.input_data_hash,
         )
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events = [
             BaseEvent(
                 event_type="FraudScreeningCompleted",
@@ -494,7 +524,11 @@ class WriteCommandHandlers:
                     "screening_model_version": command.screening_model_version,
                     "input_data_hash": command.input_data_hash,
                 },
-                metadata=_metadata(correlation_id, actor_id=command.agent_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.agent_id,
+                ),
             )
         ]
 
@@ -504,6 +538,8 @@ class WriteCommandHandlers:
             aggregate_type="AgentSession",
             events=decided_events,
             expected_version=session.version,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_compliance_check(self, command: ComplianceCheckCommand) -> AppendResult:
@@ -526,6 +562,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events: list[BaseEvent] = []
 
         if compliance.status == "NOT_STARTED":
@@ -537,7 +574,11 @@ class WriteCommandHandlers:
                         "regulation_set_version": command.regulation_set_version,
                         "checks_required": command.checks_required,
                     },
-                    metadata=_metadata(correlation_id, actor_id="compliance-engine"),
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id="compliance-engine",
+                    ),
                 )
             )
 
@@ -552,7 +593,11 @@ class WriteCommandHandlers:
                         "evaluation_timestamp": datetime.now(UTC).isoformat(),
                         "evidence_hash": f"evidence:{command.rule_id}",
                     },
-                    metadata=_metadata(correlation_id, actor_id="compliance-engine"),
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id="compliance-engine",
+                    ),
                 )
             )
         else:
@@ -566,7 +611,11 @@ class WriteCommandHandlers:
                         "failure_reason": command.failure_reason,
                         "remediation_required": command.remediation_required,
                     },
-                    metadata=_metadata(correlation_id, actor_id="compliance-engine"),
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id="compliance-engine",
+                    ),
                 )
             )
 
@@ -577,6 +626,8 @@ class WriteCommandHandlers:
             events=decided_events,
             expected_version=compliance.version,
             stream_metadata={"application_id": command.application_id},
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_generate_decision(self, command: GenerateDecisionCommand) -> AppendResult:
@@ -616,6 +667,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events = [
             BaseEvent(
                 event_type="DecisionGenerated",
@@ -631,7 +683,11 @@ class WriteCommandHandlers:
                     "compliance_status": compliance.status,
                     "assessed_max_limit_usd": assessed_max_limit,
                 },
-                metadata=_metadata(correlation_id, actor_id=command.orchestrator_agent_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.orchestrator_agent_id,
+                ),
             )
         ]
 
@@ -641,6 +697,8 @@ class WriteCommandHandlers:
             aggregate_type="LoanApplication",
             events=decided_events,
             expected_version=loan.version,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_human_review_completed(
@@ -668,6 +726,7 @@ class WriteCommandHandlers:
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
+        causation_id = command.causation_id
         decided_events: list[BaseEvent] = [
             BaseEvent(
                 event_type="HumanReviewCompleted",
@@ -678,7 +737,11 @@ class WriteCommandHandlers:
                     "final_decision": final_decision,
                     "override_reason": command.override_reason,
                 },
-                metadata=_metadata(correlation_id, actor_id=command.reviewer_id),
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.reviewer_id,
+                ),
             )
         ]
 
@@ -698,7 +761,11 @@ class WriteCommandHandlers:
                         "approved_by": command.reviewer_id,
                         "effective_date": command.effective_date,
                     },
-                    metadata=_metadata(correlation_id, actor_id=command.reviewer_id),
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id=command.reviewer_id,
+                    ),
                 )
             )
         else:
@@ -711,7 +778,11 @@ class WriteCommandHandlers:
                         "declined_by": command.reviewer_id,
                         "adverse_action_notice_required": True,
                     },
-                    metadata=_metadata(correlation_id, actor_id=command.reviewer_id),
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id=command.reviewer_id,
+                    ),
                 )
             )
 
@@ -721,6 +792,8 @@ class WriteCommandHandlers:
             aggregate_type="LoanApplication",
             events=decided_events,
             expected_version=loan.version,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
 
     async def handle_run_integrity_check(
@@ -733,8 +806,8 @@ class WriteCommandHandlers:
         audit = AuditLedgerAggregate.load(events)
 
         # 2) Validate
-        if command.role.lower() != "compliance":
-            raise DomainError("Only compliance role can run integrity checks.")
+        if command.role.lower() not in {"compliance", "admin"}:
+            raise DomainError("Only compliance or admin role can run integrity checks.")
         correlation_id = command.correlation_id or _new_correlation_id()
         metadata = _metadata(
             correlation_id=correlation_id,
@@ -769,6 +842,8 @@ class WriteCommandHandlers:
                 "entity_type": command.entity_type,
                 "entity_id": command.entity_id,
             },
+            correlation_id=correlation_id,
+            causation_id=command.causation_id,
         )
 
     async def _load_contributing_agent_events(
