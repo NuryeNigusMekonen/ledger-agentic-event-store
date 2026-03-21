@@ -20,12 +20,12 @@ from src.mcp.server import LedgerMCPServer
 
 from .auth import (
     COMMAND_ROLE_POLICY,
-    DEFAULT_DEMO_USERS,
     AuthPrincipal,
     can_bootstrap_demo,
     can_invoke_command,
     can_rebuild_projections,
     can_view_auth_audit,
+    configured_seed_users,
     create_password_hash,
     decode_access_token,
     issue_access_token,
@@ -65,8 +65,8 @@ class DemoScenarioRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     application_id: str | None = None
-    applicant_id: str = "demo-customer"
-    agent_id: str = "credit-agent-demo"
+    applicant_id: str = "et-borrower-001"
+    agent_id: str = "credit-agent-ethi-01"
     session_id: str | None = None
 
 
@@ -81,7 +81,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         await _ensure_auth_schema(store)
 
         if resolved_settings.seed_demo_users:
-            await _seed_demo_users(store)
+            await _seed_demo_users(store, configured_seed_users())
 
         mcp_server = LedgerMCPServer(store=store, auto_project=True)
         await mcp_server.initialize()
@@ -185,6 +185,54 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 ),
             )
 
+        async with app.state.store._pool.acquire() as conn:
+            auth_row = await conn.fetchrow(
+                """
+                SELECT role, is_active
+                FROM auth_users
+                WHERE username = $1
+                """,
+                principal.username,
+            )
+        if auth_row is None or not bool(auth_row["is_active"]):
+            await _write_auth_audit(
+                app.state.store,
+                username=principal.username,
+                role=principal.role,
+                action="auth_token_rejected",
+                success=False,
+                request=request,
+                details={"reason": "user_inactive_or_missing"},
+            )
+            return _json_response(
+                status_code=401,
+                content=_error_payload(
+                    error_type="AuthenticationFailed",
+                    message="Token user is inactive.",
+                    suggested_action="login_with_active_account",
+                ),
+            )
+
+        db_role = str(auth_row["role"])
+        if db_role != principal.role:
+            await _write_auth_audit(
+                app.state.store,
+                username=principal.username,
+                role=principal.role,
+                action="auth_token_rejected",
+                success=False,
+                request=request,
+                details={"reason": "role_mismatch"},
+            )
+            return _json_response(
+                status_code=401,
+                content=_error_payload(
+                    error_type="AuthenticationFailed",
+                    message="Token role no longer matches account role.",
+                    suggested_action="login_and_retry",
+                ),
+            )
+
         request.state.principal = principal
         return await call_next(request)
 
@@ -249,18 +297,30 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
         username = str(user_row["username"])
         role = str(user_row["role"])
-        token = issue_access_token(
-            username=username,
-            role=role,
-            secret=resolved_settings.jwt_secret,
-            issuer=resolved_settings.jwt_issuer,
-            ttl_minutes=resolved_settings.jwt_ttl_minutes,
-        )
-        principal = decode_access_token(
-            token,
-            secret=resolved_settings.jwt_secret,
-            issuer=resolved_settings.jwt_issuer,
-        )
+        try:
+            token = issue_access_token(
+                username=username,
+                role=role,
+                secret=resolved_settings.jwt_secret,
+                issuer=resolved_settings.jwt_issuer,
+                ttl_minutes=resolved_settings.jwt_ttl_minutes,
+            )
+            principal = decode_access_token(
+                token,
+                secret=resolved_settings.jwt_secret,
+                issuer=resolved_settings.jwt_issuer,
+            )
+        except ValueError:
+            await _write_auth_audit(
+                app.state.store,
+                username=username,
+                role=role,
+                action="auth_login",
+                success=False,
+                request=request,
+                details={"reason": "unsupported_role"},
+            )
+            return invalid_response
 
         async with app.state.store._pool.acquire() as conn:
             await conn.execute(
@@ -468,9 +528,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 {
                     "application_id": application_id,
                     "applicant_id": request_body.applicant_id,
-                    "requested_amount_usd": 10000,
-                    "loan_purpose": "equipment",
-                    "submission_channel": "portal",
+                    "requested_amount_usd": 1200000,
+                    "loan_purpose": "import_financing",
+                    "submission_channel": "addis-branch",
                     "submitted_at": datetime.now(UTC).isoformat(),
                 },
             ),
@@ -494,7 +554,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     "model_version": "credit-v2",
                     "confidence_score": 0.87,
                     "risk_tier": "MEDIUM",
-                    "recommended_limit_usd": 9500,
+                    "recommended_limit_usd": 1100000,
                     "analysis_duration_ms": 142,
                     "input_data_hash": "hash-credit-001",
                 },
@@ -548,10 +608,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "record_human_review",
                 {
                     "application_id": application_id,
-                    "reviewer_id": "loan-officer-7",
+                    "reviewer_id": "loan-officer-addis-01",
                     "override": False,
                     "final_decision": "APPROVE",
-                    "approved_amount_usd": 9000,
+                    "approved_amount_usd": 1000000,
                     "interest_rate": 7.2,
                     "conditions": ["signed guarantee"],
                     "effective_date": datetime.now(UTC).date().isoformat(),
@@ -916,9 +976,12 @@ async def _ensure_auth_schema(store: EventStore) -> None:
         )
 
 
-async def _seed_demo_users(store: EventStore) -> None:
+async def _seed_demo_users(
+    store: EventStore,
+    users: list[tuple[str, str, str]],
+) -> None:
     async with store._pool.acquire() as conn:
-        for username, password, role in DEFAULT_DEMO_USERS:
+        for username, password, role in users:
             await conn.execute(
                 """
                 INSERT INTO auth_users (
@@ -930,12 +993,27 @@ async def _seed_demo_users(store: EventStore) -> None:
                   updated_at
                 )
                 VALUES ($1, $2, $3, TRUE, NOW(), NOW())
-                ON CONFLICT (username) DO NOTHING
+                ON CONFLICT (username)
+                DO UPDATE SET
+                  password_hash = EXCLUDED.password_hash,
+                  role = EXCLUDED.role,
+                  is_active = TRUE,
+                  updated_at = NOW()
                 """,
                 username,
                 create_password_hash(password),
                 role,
             )
+
+        allowed_usernames = [username for username, _, _ in users]
+        await conn.execute(
+            """
+            UPDATE auth_users
+            SET is_active = FALSE, updated_at = NOW()
+            WHERE username <> ALL($1::text[]) AND is_active = TRUE
+            """,
+            allowed_usernames,
+        )
 
 
 async def _write_auth_audit(
