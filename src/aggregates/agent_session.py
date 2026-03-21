@@ -37,6 +37,44 @@ class AgentSessionAggregate:
                 f"Expected '{self.model_version}', got '{model_version}'."
             )
 
+    def validate_credit_analysis_submission(
+        self,
+        *,
+        model_version: str,
+        confidence_score: float,
+        recommended_limit_usd: float,
+        analysis_duration_ms: int,
+        input_data_hash: str,
+    ) -> None:
+        self.ensure_ready_for_output(
+            event_type="CreditAnalysisCompleted",
+            model_version=model_version,
+        )
+        if not (0.0 <= confidence_score <= 1.0):
+            raise DomainError("confidence_score must be between 0.0 and 1.0.")
+        if recommended_limit_usd <= 0:
+            raise DomainError("recommended_limit_usd must be > 0.")
+        if analysis_duration_ms <= 0:
+            raise DomainError("analysis_duration_ms must be > 0.")
+        if not input_data_hash:
+            raise DomainError("input_data_hash is required.")
+
+    def validate_fraud_screening_submission(
+        self,
+        *,
+        screening_model_version: str,
+        fraud_score: float,
+        input_data_hash: str,
+    ) -> None:
+        self.ensure_ready_for_output(
+            event_type="FraudScreeningCompleted",
+            model_version=screening_model_version,
+        )
+        if not (0.0 <= fraud_score <= 1.0):
+            raise DomainError("fraud_score must be between 0.0 and 1.0.")
+        if not input_data_hash:
+            raise DomainError("input_data_hash is required.")
+
     def _apply(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "AgentContextLoaded":
             self._apply_agent_context_loaded(payload)
