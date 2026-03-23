@@ -24,6 +24,9 @@ apps/web/node_modules/
 apps/web/dist/
 apps/web/.vite/
 apps/web/.env
+apps/web/tsconfig.tsbuildinfo
+coverage/
+.coverage
 
 # Editor / OS noise
 .vscode/
