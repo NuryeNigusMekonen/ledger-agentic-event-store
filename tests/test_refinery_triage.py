@@ -19,3 +19,15 @@ def test_triage_financial_document_detects_domain_and_cost(tmp_path: Path) -> No
     assert profile.origin_type == "native_digital"
     assert profile.estimated_extraction_cost == "fast_text_sufficient"
     assert (tmp_path / "profiles" / f"{profile.document_id}.json").exists()
+
+
+def test_triage_large_multi_column_reports_go_directly_to_vision() -> None:
+    triage = DocumentTriageAgent()
+
+    estimated_cost = triage._estimate_cost(
+        origin="native_digital",
+        layout="multi_column",
+        page_count=67,
+    )
+
+    assert estimated_cost == "needs_vision_model"

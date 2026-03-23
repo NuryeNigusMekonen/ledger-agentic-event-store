@@ -30,19 +30,20 @@ class ChunkingEngine:
 
     def chunk_document(self, extracted: ExtractedDocument) -> list[LDU]:
         chunks: list[LDU] = []
+        table_reference_chunks: list[LDU] = []
 
         for idx, table in enumerate(extracted.tables, start=1):
-            table_text = self._table_to_text(table.headers, table.rows)
-            chunks.append(
-                self._build_chunk(
-                    chunk_id=f"{extracted.document_id}-table-{idx}",
-                    content=table_text,
-                    chunk_type="table",
-                    page_refs=[table.page_number],
-                    bbox=table.bbox,
-                    parent_section="Table",
-                )
+            table_chunks = self._chunk_table(
+                document_id=extracted.document_id,
+                table_idx=idx,
+                headers=table.headers,
+                rows=table.rows,
+                page_number=table.page_number,
+                bbox=table.bbox,
             )
+            if table_chunks:
+                table_reference_chunks.append(table_chunks[0])
+            chunks.extend(table_chunks)
 
         for idx, figure in enumerate(extracted.figures, start=1):
             chunks.append(
@@ -67,7 +68,7 @@ class ChunkingEngine:
             )
             chunks.extend(block_chunks)
 
-        self._resolve_cross_references(chunks)
+        self._resolve_cross_references(chunks, table_reference_chunks)
         self.validator.validate(chunks)
         return chunks
 
@@ -143,8 +144,14 @@ class ChunkingEngine:
             )
         return chunks
 
-    def _resolve_cross_references(self, chunks: list[LDU]) -> None:
-        table_chunks = [chunk for chunk in chunks if chunk.chunk_type == "table"]
+    def _resolve_cross_references(
+        self,
+        chunks: list[LDU],
+        table_reference_chunks: list[LDU] | None = None,
+    ) -> None:
+        table_chunks = table_reference_chunks or [
+            chunk for chunk in chunks if chunk.chunk_type == "table"
+        ]
         if not table_chunks:
             return
 
@@ -162,6 +169,81 @@ class ChunkingEngine:
         for row in rows:
             lines.append("row: " + " | ".join(row))
         return "\n".join(lines)
+
+    def _chunk_table(
+        self,
+        *,
+        document_id: str,
+        table_idx: int,
+        headers: list[str],
+        rows: list[list[str]],
+        page_number: int,
+        bbox: BoundingBox,
+    ) -> list[LDU]:
+        header_line = "headers: " + " | ".join(headers)
+        header_tokens = len(header_line.split())
+        if header_tokens >= self.max_tokens:
+            header_line = (
+                "headers: "
+                + " ".join(header_line.split()[: max(self.max_tokens - 4, 1)])
+                + " ..."
+            )
+            header_tokens = len(header_line.split())
+
+        row_lines: list[str] = []
+        for row in rows:
+            row_text = "row: " + " | ".join(row)
+            if len(row_text.split()) + header_tokens <= self.max_tokens:
+                row_lines.append(row_text)
+                continue
+
+            allowed_tokens = max(self.max_tokens - header_tokens - 2, 1)
+            words = row_text.split()
+            for idx in range(0, len(words), allowed_tokens):
+                suffix = " row_cont:" if idx > 0 else ""
+                row_lines.append(f"{suffix} {' '.join(words[idx: idx + allowed_tokens])}".strip())
+
+        if not row_lines:
+            row_lines = ["row: "]
+
+        chunks: list[LDU] = []
+        current_lines = [header_line]
+        current_tokens = header_tokens
+        part = 1
+
+        for row_line in row_lines:
+            row_tokens = len(row_line.split())
+            if current_tokens + row_tokens > self.max_tokens and len(current_lines) > 1:
+                chunks.append(
+                    self._build_chunk(
+                        chunk_id=f"{document_id}-table-{table_idx}-{part}",
+                        content="\n".join(current_lines),
+                        chunk_type="table",
+                        page_refs=[page_number],
+                        bbox=bbox,
+                        parent_section=f"Table {table_idx}",
+                    )
+                )
+                part += 1
+                current_lines = [header_line]
+                current_tokens = header_tokens
+
+            current_lines.append(row_line)
+            current_tokens += row_tokens
+
+        if current_lines:
+            chunks.append(
+                self._build_chunk(
+                    chunk_id=f"{document_id}-table-{table_idx}-{part}",
+                    content="\n".join(current_lines),
+                    chunk_type="table",
+                    page_refs=[page_number],
+                    bbox=bbox,
+                    parent_section=f"Table {table_idx}",
+                )
+            )
+
+        return chunks
 
     def _build_chunk(
         self,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from src.refinery.llm_provider import ChatProviderConfig, resolve_chat_provider
 from src.refinery.models import LDU
 
 
@@ -74,19 +75,19 @@ class LLMFinancialFactExtractor:
         openai_model: str | None = None,
         timeout_seconds: float = 12.0,
     ) -> None:
-        resolved_gemini_key = os.getenv("GEMINI_API_KEY", "") if gemini_api_key is None else gemini_api_key
+        resolved_gemini_key = (
+            os.getenv("GEMINI_API_KEY", "") if gemini_api_key is None else gemini_api_key
+        )
         resolved_gemini_model = (
             os.getenv("GEMINI_MODEL", "gemini-2.0-flash") if gemini_model is None else gemini_model
-        )
-        resolved_openai_key = os.getenv("OPENAI_API_KEY", "") if openai_api_key is None else openai_api_key
-        resolved_openai_model = (
-            os.getenv("OPENAI_MODEL", "gpt-4o-mini") if openai_model is None else openai_model
         )
 
         self.gemini_api_key = resolved_gemini_key.strip()
         self.gemini_model = resolved_gemini_model.strip()
-        self.openai_api_key = resolved_openai_key.strip()
-        self.openai_model = resolved_openai_model.strip()
+        self.fallback_provider = resolve_chat_provider(
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+        )
         self.timeout_seconds = timeout_seconds
 
     def extract(self, raw_text: str) -> tuple[dict[str, float | None], str | None]:
@@ -97,13 +98,17 @@ class LLMFinancialFactExtractor:
 
         if self.gemini_api_key:
             gemini_result = self._extract_with_gemini(snippet)
-            if gemini_result is not None and any(value is not None for value in gemini_result.values()):
+            if gemini_result is not None and any(
+                value is not None for value in gemini_result.values()
+            ):
                 return gemini_result, "gemini"
 
-        if self.openai_api_key:
-            openai_result = self._extract_with_openai(snippet)
-            if openai_result is not None and any(value is not None for value in openai_result.values()):
-                return openai_result, "openai"
+        if self.fallback_provider is not None:
+            fallback_result = self._extract_with_chat_provider(snippet, self.fallback_provider)
+            if fallback_result is not None and any(
+                value is not None for value in fallback_result.values()
+            ):
+                return fallback_result, self.fallback_provider.provider
 
         return blank, None
 
@@ -152,14 +157,18 @@ class LLMFinancialFactExtractor:
             return None
         return _normalize_metric_payload(obj, self.METRIC_KEYS)
 
-    def _extract_with_openai(self, snippet: str) -> dict[str, float | None] | None:
+    def _extract_with_chat_provider(
+        self,
+        snippet: str,
+        provider: ChatProviderConfig,
+    ) -> dict[str, float | None] | None:
         prompt = (
             "Extract these financial metrics from the text and return strict JSON with keys:\n"
             "total_revenue, net_income, ebitda, total_assets, total_liabilities.\n"
             "Use numeric values only (no commas, no currency symbols), or null when missing."
         )
         payload = {
-            "model": self.openai_model,
+            "model": provider.model,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"DOCUMENT_TEXT:\n{snippet}"},
@@ -168,16 +177,10 @@ class LLMFinancialFactExtractor:
             "max_tokens": 256,
             "response_format": {"type": "json_object"},
         }
-        endpoint = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.openai_api_key}",
-        }
-
         req = request.Request(
-            endpoint,
+            provider.endpoint,
             data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
+            headers=provider.headers(),
             method="POST",
         )
         try:
@@ -189,9 +192,9 @@ class LLMFinancialFactExtractor:
             retry_payload = dict(payload)
             retry_payload.pop("response_format", None)
             retry_req = request.Request(
-                endpoint,
+                provider.endpoint,
                 data=json.dumps(retry_payload).encode("utf-8"),
-                headers=headers,
+                headers=provider.headers(),
                 method="POST",
             )
             try:
@@ -376,7 +379,7 @@ def _normalize_key(value: str) -> str:
 def _coerce_metric_value(value: Any) -> float | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return float(value)
     if not isinstance(value, str):
         return None

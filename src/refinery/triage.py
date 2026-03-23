@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from src.refinery.models import DocumentProfile
+from src.refinery.pdf_tools import read_pdf_page_count, read_pdf_text_pages
 
 
 class DocumentTriageAgent:
@@ -21,7 +22,11 @@ class DocumentTriageAgent:
         origin = self._detect_origin(path, char_density, image_area_ratio, text)
         layout = self._detect_layout_complexity(text)
         domain_hint = self._detect_domain_hint(text)
-        estimated_cost = self._estimate_cost(origin=origin, layout=layout)
+        estimated_cost = self._estimate_cost(
+            origin=origin,
+            layout=layout,
+            page_count=page_count,
+        )
 
         profile = DocumentProfile(
             document_id=self._stable_document_id(path),
@@ -54,9 +59,17 @@ class DocumentTriageAgent:
             try:
                 import pdfplumber  # type: ignore
             except Exception:
+                page_texts = read_pdf_text_pages(path)
+                page_count = read_pdf_page_count(path) or max(len(page_texts), 1)
+                joined = "\n".join(page_texts)
+                if joined.strip():
+                    density = len(joined) / max(page_count, 1)
+                    image_ratio = 0.12 if density >= 120 else 0.55
+                    return joined, page_count, density, image_ratio
+
                 raw = path.read_bytes()
                 snippet = raw[:20000].decode("latin1", errors="ignore")
-                return snippet, 1, float(len(snippet)), 0.8
+                return snippet, page_count, float(len(snippet)) / max(page_count, 1), 0.8
 
             with pdfplumber.open(str(path)) as pdf:
                 pages_text: list[str] = []
@@ -137,8 +150,10 @@ class DocumentTriageAgent:
                 best = domain
         return best
 
-    def _estimate_cost(self, *, origin: str, layout: str) -> str:
+    def _estimate_cost(self, *, origin: str, layout: str, page_count: int) -> str:
         if origin == "scanned_image":
+            return "needs_vision_model"
+        if page_count >= 20 and layout in {"multi_column", "table_heavy"}:
             return "needs_vision_model"
         if layout in {"multi_column", "table_heavy", "mixed"} or origin == "mixed":
             return "needs_layout_model"

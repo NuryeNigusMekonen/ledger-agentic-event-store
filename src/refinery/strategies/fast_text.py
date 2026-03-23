@@ -11,6 +11,7 @@ from src.refinery.models import (
     ExtractedTable,
     TextBlock,
 )
+from src.refinery.pdf_tools import read_pdf_text_pages
 
 
 class FastTextExtractor:
@@ -72,6 +73,14 @@ class FastTextExtractor:
         try:
             import pdfplumber  # type: ignore
         except Exception:
+            fallback_pages = read_pdf_text_pages(document_path)
+            if fallback_pages:
+                blocks = [
+                    TextBlock(page_number=idx, text=page_text)
+                    for idx, page_text in enumerate(fallback_pages, start=1)
+                ]
+                return "\n".join(fallback_pages), [], blocks
+
             fallback = document_path.read_bytes()[:50000].decode("latin1", errors="ignore")
             return fallback, [], self._text_to_blocks(fallback)
 

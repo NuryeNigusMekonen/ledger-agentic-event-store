@@ -44,38 +44,79 @@ class PageIndexBuilder:
         extracted: ExtractedDocument,
         chunks: list[LDU],
     ) -> list[PageIndexNode]:
-        by_title: dict[str, list[LDU]] = {}
-        for chunk in chunks:
-            title = chunk.parent_section or "General"
-            by_title.setdefault(title, []).append(chunk)
-
         section_nodes: list[PageIndexNode] = []
-        for idx, (title, section_chunks) in enumerate(by_title.items(), start=1):
-            pages = sorted({page for chunk in section_chunks for page in chunk.page_refs})
-            body = "\n".join(chunk.content for chunk in section_chunks[:4])
+        ordered_chunks = sorted(
+            chunks,
+            key=lambda chunk: (
+                min(chunk.page_refs or [1]),
+                self._chunk_type_priority(chunk.chunk_type),
+                chunk.chunk_id,
+            ),
+        )
+
+        current_title: str | None = None
+        current_chunks: list[LDU] = []
+
+        def flush_section() -> None:
+            if not current_chunks or current_title is None:
+                return
+            pages = sorted({page for chunk in current_chunks for page in chunk.page_refs})
+            body = "\n".join(chunk.content for chunk in current_chunks[:4])
+            node_idx = len(section_nodes) + 1
             section_nodes.append(
                 PageIndexNode(
-                    node_id=f"{extracted.document_id}-section-{idx}",
-                    title=title,
+                    node_id=f"{extracted.document_id}-section-{node_idx}",
+                    title=current_title,
                     page_start=pages[0],
                     page_end=pages[-1],
                     child_sections=[],
                     key_entities=self._extract_entities(body),
                     summary=self._summarize_text(body),
-                    data_types_present=sorted({chunk.chunk_type for chunk in section_chunks}),
+                    data_types_present=sorted({chunk.chunk_type for chunk in current_chunks}),
                 )
             )
+
+        for chunk in ordered_chunks:
+            title = self._normalize_section_title(chunk)
+            if current_title is None:
+                current_title = title
+                current_chunks = [chunk]
+                continue
+
+            current_pages = {
+                page
+                for section_chunk in current_chunks
+                for page in section_chunk.page_refs
+            }
+            chunk_pages = set(chunk.page_refs)
+            page_break = bool(
+                chunk_pages and current_pages and min(chunk_pages) > max(current_pages)
+            )
+            should_split_general = current_title == "General" and page_break
+            if title != current_title or should_split_general:
+                flush_section()
+                current_title = title
+                current_chunks = [chunk]
+                continue
+
+            current_chunks.append(chunk)
+
+        flush_section()
         return section_nodes
 
     def _extract_entities(self, text: str) -> list[str]:
-        entities = re.findall(r"\b[A-Z][A-Za-z]{2,}(?:\s+[A-Z][A-Za-z]{2,})*\b", text)
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        entities = re.findall(r"\b[A-Z][A-Za-z]{1,}(?:\s+[A-Z][A-Za-z]{1,})*\b", cleaned)
         deduped: list[str] = []
         seen: set[str] = set()
         for entity in entities:
-            if entity.lower() in seen:
+            normalized = " ".join(entity.split()).strip()
+            if len(normalized.split()) > 4:
                 continue
-            seen.add(entity.lower())
-            deduped.append(entity)
+            if normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(normalized)
             if len(deduped) >= 8:
                 break
         return deduped
@@ -100,6 +141,39 @@ class PageIndexBuilder:
     def _persist(self, index: PageIndex) -> None:
         out = self.pageindex_dir / f"{index.document_id}.json"
         out.write_text(index.model_dump_json(indent=2), encoding="utf-8")
+
+    def _normalize_section_title(self, chunk: LDU) -> str:
+        title = (chunk.parent_section or "").strip()
+        if title and title.lower() != "document":
+            return title
+
+        lines = [line.strip() for line in chunk.content.splitlines() if line.strip()]
+        for candidate in lines[:3]:
+            normalized = re.sub(r"\s+", " ", candidate).strip(" -|")
+            if not normalized or len(normalized) > 80:
+                continue
+            if normalized.lower().startswith("headers:"):
+                return "Table"
+            if normalized.isdigit():
+                continue
+            if re.match(r"^(\d+(\.\d+)*)\s+", normalized):
+                return normalized[:120]
+            words = normalized.split()
+            if len(words) <= 10 and sum(
+                1 for word in words if word[:1].isupper()
+            ) >= max(1, len(words) // 2):
+                return normalized[:120]
+        return "General"
+
+    def _chunk_type_priority(self, chunk_type: str) -> int:
+        priority = {
+            "paragraph": 0,
+            "list": 1,
+            "table": 2,
+            "figure": 3,
+            "section": 4,
+        }
+        return priority.get(chunk_type, 9)
 
 
 def _token_overlap_score(query: str, text: str) -> float:

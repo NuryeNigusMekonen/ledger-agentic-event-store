@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from src.refinery.llm_provider import ChatProviderConfig, resolve_chat_provider
 from src.refinery.models import DocumentProfile, ExtractedDocument
+from src.refinery.strategies.fast_text import FastTextExtractor
 from src.refinery.strategies.layout import LayoutExtractor
 
 
@@ -24,44 +26,62 @@ class VisionExtractor:
         gemini_timeout_seconds: float = 12.0,
     ) -> None:
         self.max_cost_usd = max_cost_usd
+        self.fast_text_extractor = FastTextExtractor()
         self.layout_extractor = LayoutExtractor()
-        resolved_api_key = os.getenv("GEMINI_API_KEY", "") if gemini_api_key is None else gemini_api_key
+        # If caller explicitly pins a Gemini model, favor Gemini flow over provider-first mode.
+        self._gemini_model_explicit = gemini_model is not None
+        resolved_api_key = (
+            os.getenv("GEMINI_API_KEY", "") if gemini_api_key is None else gemini_api_key
+        )
         resolved_model = (
             os.getenv("GEMINI_MODEL", "gemini-2.0-flash") if gemini_model is None else gemini_model
         )
-        # Only auto-load OpenAI key from env when gemini_api_key wasn't explicitly set by caller.
-        # This keeps explicit test/dev usage predictable (e.g., gemini_api_key="").
-        if openai_api_key is None:
-            resolved_openai_api_key = (
-                os.getenv("OPENAI_API_KEY", "") if gemini_api_key is None else ""
-            )
-        else:
-            resolved_openai_api_key = openai_api_key
-        resolved_openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini") if openai_model is None else openai_model
         self.gemini_api_key = resolved_api_key.strip()
         self.gemini_model = resolved_model.strip()
-        self.openai_api_key = resolved_openai_api_key.strip()
-        self.openai_model = resolved_openai_model.strip()
+        self.fallback_provider = resolve_chat_provider(
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+        )
         self.gemini_timeout_seconds = gemini_timeout_seconds
 
     def extract(self, document_path: Path, profile: DocumentProfile) -> ExtractedDocument:
+        estimated_cost = min(self.max_cost_usd, max(0.05, 0.08 * profile.page_count))
+        if (
+            self.fallback_provider is not None
+            and self.fallback_provider.provider == "openrouter"
+            and not self._gemini_model_explicit
+        ):
+            provider_first_base = self.fast_text_extractor.extract(document_path, profile)
+            provider_first = self._provider_first_extract(provider_first_base, estimated_cost)
+            if provider_first is not None:
+                return provider_first
+
         # Keep deterministic local extraction so the pipeline works offline.
         base = self.layout_extractor.extract(document_path, profile)
-        estimated_cost = min(self.max_cost_usd, max(0.05, 0.08 * profile.page_count))
         confidence_boost = 0.1
         metadata: dict[str, str | int | float | bool] = {
             **base.metadata,
             "vision_fallback_mode": True,
+            "vision_entry_mode": "layout_first",
             "budget_guard_max_cost_usd": self.max_cost_usd,
             "gemini_enabled": bool(self.gemini_api_key),
-            "openai_enabled": bool(self.openai_api_key),
+            "openai_enabled": bool(
+                self.fallback_provider and self.fallback_provider.provider == "openai"
+            ),
+            "openrouter_enabled": bool(
+                self.fallback_provider and self.fallback_provider.provider == "openrouter"
+            ),
         }
 
         insight: dict[str, str | int | float] | None = None
         if self.gemini_api_key:
             insight = self._gemini_refine(base.raw_text)
             if insight is None:
-                metadata["gemini_status"] = "fallback_openai" if self.openai_api_key else "fallback_local_only"
+                metadata["gemini_status"] = (
+                    f"fallback_{self.fallback_provider.provider}"
+                    if self.fallback_provider is not None
+                    else "fallback_local_only"
+                )
             else:
                 confidence_boost = max(confidence_boost, float(insight["confidence_boost"]))
                 metadata["gemini_status"] = "ok"
@@ -69,24 +89,76 @@ class VisionExtractor:
                 metadata["gemini_quality"] = str(insight["quality"])
                 metadata["gemini_detected_metrics"] = int(insight["detected_metrics_count"])
                 metadata["llm_provider"] = "gemini"
-                metadata["openai_status"] = "not_needed"
+                if self.fallback_provider is not None:
+                    metadata[f"{self.fallback_provider.provider}_status"] = "not_needed"
         else:
             metadata["gemini_status"] = "disabled_missing_api_key"
 
-        if insight is None and self.openai_api_key:
-            openai_insight = self._openai_refine(base.raw_text)
-            if openai_insight is None:
-                metadata["openai_status"] = "fallback_local_only"
+        if insight is None and self.fallback_provider is not None:
+            provider_insight = self._chat_refine(base.raw_text, self.fallback_provider)
+            status_key = f"{self.fallback_provider.provider}_status"
+            model_key = f"{self.fallback_provider.provider}_model"
+            quality_key = f"{self.fallback_provider.provider}_quality"
+            metrics_key = f"{self.fallback_provider.provider}_detected_metrics"
+            if provider_insight is None:
+                metadata[status_key] = "fallback_local_only"
             else:
-                confidence_boost = max(confidence_boost, float(openai_insight["confidence_boost"]))
-                metadata["openai_status"] = "ok"
-                metadata["openai_model"] = self.openai_model
-                metadata["openai_quality"] = str(openai_insight["quality"])
-                metadata["openai_detected_metrics"] = int(openai_insight["detected_metrics_count"])
-                metadata["llm_provider"] = "openai"
-        elif "openai_status" not in metadata:
+                confidence_boost = max(
+                    confidence_boost,
+                    float(provider_insight["confidence_boost"]),
+                )
+                metadata[status_key] = "ok"
+                metadata[model_key] = self.fallback_provider.model
+                metadata[quality_key] = str(provider_insight["quality"])
+                metadata[metrics_key] = int(provider_insight["detected_metrics_count"])
+                metadata["llm_provider"] = self.fallback_provider.provider
+        elif self.fallback_provider is None:
             metadata["openai_status"] = "disabled_missing_api_key"
+            metadata["openrouter_status"] = "disabled_missing_api_key"
 
+        return base.model_copy(
+            update={
+                "strategy_used": self.name,
+                "confidence_score": min(1.0, base.confidence_score + confidence_boost),
+                "estimated_cost_usd": estimated_cost,
+                "metadata": metadata,
+            }
+        )
+
+    def _provider_first_extract(
+        self,
+        base: ExtractedDocument,
+        estimated_cost: float,
+    ) -> ExtractedDocument | None:
+        if self.fallback_provider is None or self.fallback_provider.provider != "openrouter":
+            return None
+        if not base.raw_text.strip():
+            return None
+
+        provider_insight = self._chat_refine(base.raw_text, self.fallback_provider)
+        if provider_insight is None:
+            return None
+
+        metadata: dict[str, str | int | float | bool] = {
+            **base.metadata,
+            "vision_fallback_mode": False,
+            "vision_entry_mode": "provider_first",
+            "budget_guard_max_cost_usd": self.max_cost_usd,
+            "gemini_enabled": bool(self.gemini_api_key),
+            "openai_enabled": False,
+            "openrouter_enabled": True,
+            "openrouter_status": "ok",
+            "openrouter_model": self.fallback_provider.model,
+            "openrouter_quality": str(provider_insight["quality"]),
+            "openrouter_detected_metrics": int(provider_insight["detected_metrics_count"]),
+            "llm_provider": "openrouter",
+        }
+        metadata["gemini_status"] = (
+            "not_needed" if self.gemini_api_key else "disabled_missing_api_key"
+        )
+        metadata["openai_status"] = "disabled_missing_api_key"
+
+        confidence_boost = max(0.1, float(provider_insight["confidence_boost"]))
         return base.model_copy(
             update={
                 "strategy_used": self.name,
@@ -164,7 +236,11 @@ class VisionExtractor:
             "detected_metrics_count": metrics_count,
         }
 
-    def _openai_refine(self, raw_text: str) -> dict[str, str | int | float] | None:
+    def _chat_refine(
+        self,
+        raw_text: str,
+        provider: ChatProviderConfig,
+    ) -> dict[str, str | int | float] | None:
         snippet = raw_text.strip()[:12000]
         if not snippet:
             return None
@@ -178,7 +254,7 @@ class VisionExtractor:
             "Do not include markdown fences."
         )
         payload = {
-            "model": self.openai_model,
+            "model": provider.model,
             "messages": [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"DOCUMENT_TEXT:\n{snippet}"},
@@ -187,16 +263,10 @@ class VisionExtractor:
             "max_tokens": 256,
             "response_format": {"type": "json_object"},
         }
-        endpoint = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.openai_api_key}",
-        }
-
         req = request.Request(
-            endpoint,
+            provider.endpoint,
             data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
+            headers=provider.headers(),
             method="POST",
         )
         try:
@@ -209,9 +279,9 @@ class VisionExtractor:
             retry_payload = dict(payload)
             retry_payload.pop("response_format", None)
             retry_req = request.Request(
-                endpoint,
+                provider.endpoint,
                 data=json.dumps(retry_payload).encode("utf-8"),
-                headers=headers,
+                headers=provider.headers(),
                 method="POST",
             )
             try:
