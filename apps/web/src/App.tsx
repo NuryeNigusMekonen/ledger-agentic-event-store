@@ -4,15 +4,19 @@ import {
   bootstrapDemo,
   clearStoredToken,
   fetchAgentPerformance,
+  fetchAgentSession,
   fetchApplication,
   fetchApplicationAuditTrail,
+  fetchApplicationEvents,
   fetchApplications,
+  fetchResources,
   fetchApplicationStates,
   fetchAuthAudit,
   fetchCompliance,
   fetchLedgerHealth,
   fetchMe,
   fetchRecentEvents,
+  fetchResourceByUri,
   fetchTools,
   LedgerApiError,
   login,
@@ -22,12 +26,14 @@ import {
 } from "./api";
 import type {
   AgentPerformance,
+  AgentSessionReplay,
   AppStateCount,
   ApplicationSummary,
   ComplianceTimelineEvent,
   ComplianceView,
   LedgerHealth,
   RecentEvent,
+  ResourceDefinition,
   ToolDefinition
 } from "./types";
 import apexLogo from "../logo/logo.png";
@@ -57,21 +63,29 @@ const OPERATING_FABRIC = [
   {
     name: "FraudDetection",
     role: "Fraud and anomaly screening",
-    eventTypes: ["FraudScreeningCompleted"]
+    eventTypes: ["FraudScreeningRequested", "FraudScreeningCompleted"]
   },
   {
     name: "ComplianceAgent",
     role: "Regulation and policy checks",
-    eventTypes: ["ComplianceCheckRequested", "ComplianceRulePassed", "ComplianceRuleFailed"]
+    eventTypes: [
+      "ComplianceCheckRequested",
+      "ComplianceRulePassed",
+      "ComplianceRuleFailed",
+      "ComplianceCheckCompleted"
+    ]
   },
   {
     name: "DecisionOrchestrator",
     role: "Machine recommendation synthesis",
-    eventTypes: ["DecisionGenerated"]
+    eventTypes: ["DecisionRequested", "DecisionGenerated", "HumanReviewRequested"]
   }
 ] as const;
 
-type Tone = "ok" | "warning" | "critical" | "neutral";
+type Tone = "ok" | "warning" | "critical" | "neutral" | "info";
+type WorkspaceMode = "operations" | "audit" | "system";
+type TimelinePhase = "Intake" | "Analysis" | "Compliance" | "Decision" | "Final Outcome";
+type EventTimeRange = "all" | "1h" | "24h" | "7d" | "30d";
 
 type LineageItem = {
   key: string;
@@ -90,13 +104,30 @@ type LineageItem = {
 
 type ProjectionAssessment = {
   tone: Tone;
-  label: string;
-  helper: string;
+  statusLabel: string;
+  severityLabel: string;
+  explanation: string;
   isSynced: boolean;
 };
 
-type WorkspaceMode = "operations" | "audit";
 type EvidencePanelKey = "integrity" | "snapshot" | "lineage" | "activity" | "compliance";
+
+type ResourceQueryHistoryEntry = {
+  uri: string;
+  preview: string;
+  loadedAt: string;
+};
+
+type TimelineGroup = {
+  key: string;
+  phase: TimelinePhase;
+  items: LineageItem[];
+};
+
+type ExpectedEventGroup = {
+  label: string;
+  eventTypes: string[];
+};
 
 const EVIDENCE_PANEL_KEYS: EvidencePanelKey[] = [
   "integrity",
@@ -105,6 +136,56 @@ const EVIDENCE_PANEL_KEYS: EvidencePanelKey[] = [
   "activity",
   "compliance"
 ];
+
+const EXPECTED_EVENT_GROUPS: ExpectedEventGroup[] = [
+  {
+    label: "Core Loan Decisioning",
+    eventTypes: [
+      "ApplicationSubmitted",
+      "CreditAnalysisRequested",
+      "AgentContextLoaded",
+      "CreditAnalysisCompleted",
+      "FraudScreeningCompleted",
+      "ComplianceCheckRequested",
+      "ComplianceRulePassed",
+      "ComplianceRuleFailed",
+      "DecisionGenerated",
+      "HumanReviewCompleted",
+      "ApplicationApproved",
+      "ApplicationDeclined",
+      "AuditIntegrityCheckRun"
+    ]
+  },
+  {
+    label: "Lifecycle / Request",
+    eventTypes: [
+      "DocumentUploadRequested",
+      "DocumentUploaded",
+      "FraudScreeningRequested",
+      "DecisionRequested",
+      "HumanReviewRequested",
+      "ComplianceCheckCompleted",
+      "AgentSessionStarted",
+      "AgentSessionRecovered"
+    ]
+  },
+  {
+    label: "Document Processing",
+    eventTypes: [
+      "PackageCreated",
+      "DocumentAdded",
+      "DocumentFormatValidated",
+      "ExtractionStarted",
+      "ExtractionCompleted",
+      "QualityAssessmentCompleted",
+      "PackageReadyForAnalysis"
+    ]
+  }
+];
+
+const EXPECTED_EVENT_TYPES = Array.from(
+  new Set(EXPECTED_EVENT_GROUPS.flatMap((group) => group.eventTypes))
+);
 
 function prettyDate(value: string | null | undefined): string {
   if (!value) {
@@ -185,6 +266,15 @@ function toTone(value: string | null | undefined): Tone {
     return "warning";
   }
   if (
+    normalized.includes("live") ||
+    normalized.includes("progress") ||
+    normalized.includes("requested") ||
+    normalized.includes("running") ||
+    normalized.includes("sync")
+  ) {
+    return "info";
+  }
+  if (
     normalized.includes("ok") ||
     normalized.includes("healthy") ||
     normalized.includes("cleared") ||
@@ -247,6 +337,66 @@ function formatLagMs(value: number): string {
   return `${Math.round(value).toLocaleString()} ms`;
 }
 
+function previewJson(value: unknown): string {
+  const serialized =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return serialized.length > 160 ? `${serialized.slice(0, 157)}...` : serialized;
+}
+
+function eventPhase(eventType: string): TimelinePhase {
+  if (eventType === "ApplicationSubmitted" || eventType.startsWith("Document")) {
+    return "Intake";
+  }
+  if (
+    eventType.startsWith("Credit") ||
+    eventType.startsWith("Fraud") ||
+    eventType.startsWith("AgentSession") ||
+    eventType === "AgentContextLoaded"
+  ) {
+    return "Analysis";
+  }
+  if (eventType.startsWith("Compliance")) {
+    return "Compliance";
+  }
+  if (
+    eventType === "DecisionRequested" ||
+    eventType === "DecisionGenerated" ||
+    eventType === "HumanReviewRequested"
+  ) {
+    return "Decision";
+  }
+  return "Final Outcome";
+}
+
+function isFinalDecisionEvent(eventType: string): boolean {
+  return (
+    eventType === "ApplicationApproved" ||
+    eventType === "ApplicationDeclined" ||
+    eventType === "HumanReviewCompleted"
+  );
+}
+
+function matchesTimeRange(recordedAt: string, range: EventTimeRange): boolean {
+  if (range === "all") {
+    return true;
+  }
+
+  const eventTime = new Date(recordedAt).getTime();
+  if (Number.isNaN(eventTime)) {
+    return false;
+  }
+
+  const now = Date.now();
+  const durations: Record<Exclude<EventTimeRange, "all">, number> = {
+    "1h": 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000,
+    "30d": 30 * 24 * 60 * 60 * 1000
+  };
+
+  return now - eventTime <= durations[range];
+}
+
 function conciseDescription(value: string | null | undefined): string {
   if (!value) {
     return "No command guidance available.";
@@ -278,7 +428,7 @@ function presentAuditAction(value: string): string {
       start_agent_session: "Start Agent Session",
       record_credit_analysis: "Record Credit Analysis",
       record_fraud_screening: "Record Fraud Screening",
-      run_compliance_check: "Run Compliance Check",
+      record_compliance_check: "Record Compliance Check",
       generate_decision: "Generate Decision",
       record_human_review: "Record Human Review",
       run_integrity_check: "Run Integrity Check"
@@ -291,11 +441,44 @@ function presentAuditAction(value: string): string {
 function presentAuditOutcome(row: AuthAuditRow): { label: string; tone: Tone; helper: string } {
   const details = readRecord(row.details);
   const reason = readString(details.reason);
+  const errorType = readString(details.error_type);
+  const errorMessage = readString(details.message);
   if (row.success) {
     return { label: "Success", tone: "ok", helper: "Authorized action" };
   }
   if (reason === "role_forbidden") {
     return { label: "Policy denied", tone: "warning", helper: "Blocked by role-scoped access" };
+  }
+  if (reason === "timeout") {
+    return { label: "Timed out", tone: "warning", helper: "Command exceeded execution timeout" };
+  }
+  if (errorType === "PreconditionFailed") {
+    return {
+      label: "Precondition failed",
+      tone: "warning",
+      helper: errorMessage ?? "Domain preconditions were not met"
+    };
+  }
+  if (errorType === "ValidationError") {
+    return {
+      label: "Invalid payload",
+      tone: "warning",
+      helper: errorMessage ?? "Command input failed validation"
+    };
+  }
+  if (errorType === "DomainError") {
+    return {
+      label: "Domain blocked",
+      tone: "warning",
+      helper: errorMessage ?? "Business rule prevented this operation"
+    };
+  }
+  if (errorType) {
+    return {
+      label: "Failed",
+      tone: "critical",
+      helper: errorMessage ?? `${titleize(errorType)} returned by command`
+    };
   }
   return { label: "Denied", tone: "critical", helper: "Rejected by control policy" };
 }
@@ -344,22 +527,47 @@ function eventMatchesApplication(event: RecentEvent, applicationId: string): boo
   return payloadAppId === applicationId || event.stream_id.includes(applicationId);
 }
 
+function extractSessionId(event: RecentEvent): string | null {
+  const payloadSession = readString(event.payload.session_id);
+  if (payloadSession) {
+    return payloadSession;
+  }
+  const marker = "-session-";
+  const markerIndex = event.stream_id.indexOf(marker);
+  if (markerIndex < 0) {
+    return null;
+  }
+  return event.stream_id.slice(markerIndex + 1);
+}
+
 function actorForEvent(eventType: string, payload: Record<string, unknown>, metadata: Record<string, unknown>): string {
   const actorId = readString(metadata.actor_id);
   if (actorId) {
     return actorId;
   }
+  if (eventType === "DocumentUploadRequested" || eventType === "DocumentUploaded") {
+    return readString(payload.requested_by) ?? readString(payload.uploaded_by) ?? "Document Intake";
+  }
   if (eventType.startsWith("Compliance")) {
     return "ComplianceAgent";
   }
+  if (eventType === "AgentSessionStarted" || eventType === "AgentSessionRecovered" || eventType === "AgentContextLoaded") {
+    return readString(payload.agent_id) ?? "Agent Session";
+  }
   if (eventType.startsWith("Credit")) {
-    return readString(payload.agent_id) ?? "CreditAnalysis";
+    return readString(payload.agent_id) ?? readString(payload.assigned_agent_id) ?? "CreditAnalysis";
   }
   if (eventType.startsWith("Fraud")) {
-    return readString(payload.agent_id) ?? "FraudDetection";
+    return readString(payload.agent_id) ?? readString(payload.assigned_agent_id) ?? "FraudDetection";
+  }
+  if (eventType === "DecisionRequested") {
+    return readString(payload.requested_by) ?? "DecisionOrchestrator";
   }
   if (eventType === "DecisionGenerated") {
     return readString(payload.orchestrator_agent_id) ?? "DecisionOrchestrator";
+  }
+  if (eventType === "HumanReviewRequested") {
+    return readString(payload.requested_by) ?? "DecisionOrchestrator";
   }
   if (eventType === "HumanReviewCompleted") {
     return readString(payload.reviewer_id) ?? "Loan Officer";
@@ -383,6 +591,12 @@ function laneForEvent(eventType: string): string {
   if (eventType === "ApplicationSubmitted") {
     return "Intake";
   }
+  if (eventType === "DocumentUploadRequested" || eventType === "DocumentUploaded") {
+    return "Document Intake";
+  }
+  if (eventType === "AgentSessionStarted" || eventType === "AgentSessionRecovered" || eventType === "AgentContextLoaded") {
+    return "Agent Session";
+  }
   if (eventType.startsWith("Credit")) {
     return "CreditAnalysis";
   }
@@ -392,7 +606,7 @@ function laneForEvent(eventType: string): string {
   if (eventType.startsWith("Compliance")) {
     return "ComplianceAgent";
   }
-  if (eventType === "DecisionGenerated") {
+  if (eventType === "DecisionRequested" || eventType === "DecisionGenerated" || eventType === "HumanReviewRequested") {
     return "DecisionOrchestrator";
   }
   if (eventType === "HumanReviewCompleted") {
@@ -408,8 +622,11 @@ function laneForEvent(eventType: string): string {
 }
 
 function checkpointForEvent(eventType: string): string {
-  if (eventType === "DecisionGenerated") {
+  if (eventType === "DecisionRequested" || eventType === "DecisionGenerated") {
     return "Machine checkpoint";
+  }
+  if (eventType === "HumanReviewRequested") {
+    return "Awaiting binding review";
   }
   if (eventType === "HumanReviewCompleted") {
     return "Binding review";
@@ -430,11 +647,26 @@ function describeEvent(eventType: string, payload: Record<string, unknown>): str
   if (eventType === "ApplicationSubmitted") {
     return `Commercial application submitted for ${formatMoney(readNumber(payload.requested_amount_usd))}.`;
   }
+  if (eventType === "DocumentUploadRequested") {
+    return "Document upload requested for the submitted application package.";
+  }
+  if (eventType === "DocumentUploaded") {
+    return "Application document package uploaded and ready for downstream processing.";
+  }
+  if (eventType === "AgentSessionStarted") {
+    return `Agent session started with model ${readString(payload.model_version) ?? "unknown"}.`;
+  }
+  if (eventType === "AgentSessionRecovered") {
+    return `Agent session recovered context from ${readString(payload.recovered_from_session_id) ?? "prior session"}.`;
+  }
   if (eventType === "AgentContextLoaded") {
     return `Agent session loaded with replay context from ledger position ${readNumber(payload.event_replay_from_position) ?? 0}.`;
   }
   if (eventType === "CreditAnalysisRequested") {
     return "Credit analysis requested after intake and document processing.";
+  }
+  if (eventType === "FraudScreeningRequested") {
+    return "Fraud screening requested from anomaly detection workflow.";
   }
   if (eventType === "CreditAnalysisCompleted") {
     return `Credit analysis produced ${readString(payload.risk_tier) ?? "unclassified"} risk with confidence ${readNumber(payload.confidence_score)?.toFixed(2) ?? "n/a"}.`;
@@ -451,8 +683,17 @@ function describeEvent(eventType: string, payload: Record<string, unknown>): str
   if (eventType === "ComplianceRuleFailed") {
     return `Compliance rule ${readString(payload.rule_id) ?? "unknown"} failed${readString(payload.failure_reason) ? `: ${readString(payload.failure_reason)}` : "."}`;
   }
+  if (eventType === "ComplianceCheckCompleted") {
+    return `Compliance check set completed with overall verdict ${titleize(readString(payload.overall_verdict) ?? "pending")}.`;
+  }
+  if (eventType === "DecisionRequested") {
+    return "Decision orchestration requested using credit, fraud, and compliance evidence.";
+  }
   if (eventType === "DecisionGenerated") {
     return `DecisionOrchestrator recommended ${readString(payload.recommendation) ?? "review"} with confidence ${readNumber(payload.confidence_score)?.toFixed(2) ?? "n/a"}.`;
+  }
+  if (eventType === "HumanReviewRequested") {
+    return "Human loan officer review requested before final binding decision.";
   }
   if (eventType === "HumanReviewCompleted") {
     return `Human loan officer recorded ${readString(payload.final_decision) ?? "review"} as the binding action${payload.override ? " with override applied." : "."}`;
@@ -524,16 +765,754 @@ function MetricTile(props: {
   tone?: Tone;
 }): ReactNode {
   return (
-    <article className={`metric-tile tone-${props.tone ?? "neutral"}`}>
+    <article className={`metric-tile tone-${props.tone ?? "neutral"}`} title={props.detail}>
       <span className="metric-label">{props.label}</span>
-      <strong className="metric-value">{props.value}</strong>
-      <span className="metric-detail">{props.detail}</span>
+      <div className="metric-main">
+        <strong className="metric-value">{props.value}</strong>
+        <span className="metric-detail">{props.detail}</span>
+      </div>
     </article>
   );
 }
 
 function StatusBadge(props: { label: string; tone?: Tone }): ReactNode {
   return <span className={`status-badge tone-${props.tone ?? "neutral"}`}>{props.label}</span>;
+}
+
+function FocusedRecordSummary(props: {
+  application: ApplicationSummary | null;
+  onCopyApplicationId: (applicationId: string) => void;
+}): ReactNode {
+  if (!props.application) {
+    return null;
+  }
+
+  const application = props.application;
+
+  return (
+    <section className="panel focus-banner">
+      <div className="focus-banner-main">
+        <div className="focus-banner-title">
+          <p className="section-kicker">Focused record</p>
+          <div className="record-id-row">
+            <h2 title={application.application_id}>{shortId(application.application_id, 8)}</h2>
+            <button
+              type="button"
+              className="button subtle copy-id-button"
+              onClick={() => props.onCopyApplicationId(application.application_id)}
+              title={application.application_id}
+            >
+              Copy ID
+            </button>
+          </div>
+        </div>
+        <div className="focus-banner-status">
+          <span className={`focus-status tone-${toTone(application.current_state)}`}>
+            {titleize(application.current_state)}
+          </span>
+        </div>
+      </div>
+      <div className="focus-banner-grid">
+        <div className="focus-inline-item">
+          <span>Requested</span>
+          <strong>{formatMoney(application.requested_amount_usd)}</strong>
+        </div>
+        <div className="focus-inline-item">
+          <span>Recommendation</span>
+          <strong>{titleize(application.decision_recommendation ?? "Pending")}</strong>
+        </div>
+        <div className="focus-inline-item">
+          <span>Compliance</span>
+          <strong>{titleize(application.compliance_status ?? "Not started")}</strong>
+        </div>
+        <div className="focus-inline-item">
+          <span>Last</span>
+          <strong>{titleize(application.last_event_type)}</strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AgentPipelineFlow(props: {
+  stages: Array<{
+    name: string;
+    role: string;
+    status: string;
+    latestEvent: string;
+    latestAt: string;
+    tone: Tone;
+  }>;
+  compact?: boolean;
+}): ReactNode {
+  return (
+    <section className={`panel operating-model ${props.compact ? "operating-model-compact" : ""}`}>
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Agent Workflow</p>
+          <h2>Decision pipeline</h2>
+        </div>
+        {!props.compact ? (
+          <p className="section-note">CreditAnalysis through human approval with evidence at every stage.</p>
+        ) : null}
+      </div>
+
+      <div className="pipeline-flow">
+        {props.stages.map((stage, index) => (
+          <div className="pipeline-segment" key={stage.name}>
+            <article
+              className={`pipeline-step tone-${stage.tone} ${stage.name === "HumanReview" ? "pipeline-step-human" : ""}`}
+            >
+              <div className="fabric-header">
+                <strong>{stage.name}</strong>
+                <StatusBadge label={stage.status} tone={stage.tone} />
+              </div>
+              {!props.compact ? <span className="fabric-role">{stage.role}</span> : null}
+              <div className="fabric-meta">
+                <span>{stage.latestEvent}</span>
+                <time>{stage.latestAt}</time>
+              </div>
+            </article>
+            {!props.compact && index < props.stages.length - 1 ? (
+              <div className="pipeline-arrow" aria-hidden="true">
+                <span>&rarr;</span>
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function IntegrityStatusCard(props: {
+  title: string;
+  status: string;
+  tone: Tone;
+  verified: number;
+  total: number;
+  evidenceHash: string;
+  verifiedAt: string;
+  verifiedWindow: string;
+  tamperState: string;
+  hasIntegrityCommand: boolean;
+  busy: boolean;
+  onRunVerification: () => void;
+  showEvidenceToggle?: boolean;
+  evidenceExpanded?: boolean;
+  onToggleEvidence?: () => void;
+}): ReactNode {
+  const progress = props.total > 0 ? Math.min(100, Math.round((props.verified / props.total) * 100)) : 0;
+
+  return (
+    <section className="panel integrity-card">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Integrity Verification</p>
+          <h2>{props.title}</h2>
+        </div>
+        <div className="panel-actions">
+          <StatusBadge label={props.status} tone={props.tone} />
+          {props.showEvidenceToggle && props.onToggleEvidence ? (
+            <button type="button" className="text-button" onClick={props.onToggleEvidence}>
+              {props.evidenceExpanded ? "Hide evidence" : "Show evidence"}
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="integrity-overview">
+        <div className="integrity-stat">
+          <span>Verified vs total</span>
+          <strong>
+            {props.verified} / {props.total}
+          </strong>
+        </div>
+        <div className="integrity-stat">
+          <span>Latest verification</span>
+          <strong>{props.verifiedAt}</strong>
+        </div>
+        <div className="integrity-stat">
+          <span>Evidence hash</span>
+          <strong>{props.evidenceHash}</strong>
+        </div>
+      </div>
+
+      <div className="integrity-progress">
+        <div className="integrity-progress-head">
+          <span>Verification coverage</span>
+          <strong>{progress}%</strong>
+        </div>
+        <div className="progress-track" aria-hidden="true">
+          <span className="progress-fill integrity-progress-fill" style={{ width: `${Math.max(progress, props.verified > 0 ? 8 : 0)}%` }} />
+        </div>
+        <p className="projection-note">{props.verifiedWindow}</p>
+      </div>
+
+      <div className="quick-actions">
+        <button className="button" type="button" onClick={props.onRunVerification} disabled={!props.hasIntegrityCommand || props.busy}>
+          Run verification
+        </button>
+      </div>
+
+      {props.evidenceExpanded ? (
+        <div className="evidence-inline">
+          <span className="meta-label">Tamper state</span>
+          <p className="field-note">{props.tamperState}</p>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ProjectionHealthPanel(props: {
+  rows: Array<{
+    name: string;
+    lag: {
+      checkpoint_position: number;
+      latest_position: number;
+      events_behind: number;
+      lag_ms: number;
+      status: string;
+      updated_at: string;
+    };
+    assessment: ProjectionAssessment;
+  }>;
+}): ReactNode {
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Projection Status</p>
+          <h2>Sync and lag watchdog</h2>
+        </div>
+      </div>
+
+      <div className="projection-list">
+        {props.rows.length === 0 ? (
+          <p className="empty-state">Projection checkpoints have not reported yet.</p>
+        ) : (
+          props.rows.map(({ name, lag, assessment }) => {
+            const ratio = lag.latest_position > 0 ? lag.checkpoint_position / lag.latest_position : 1;
+            const errorState =
+              assessment.tone === "critical"
+                ? "Attention required"
+                : assessment.tone === "warning"
+                  ? "Warning"
+                  : "No reported error";
+
+            return (
+              <article className={`projection-row projection-${assessment.tone}`} key={name}>
+                <div className="projection-head">
+                  <strong>{titleize(name)}</strong>
+                  <StatusBadge label={assessment.statusLabel} tone={assessment.tone} />
+                </div>
+                <div className="projection-grid">
+                  <div>
+                    <span>Status</span>
+                    <strong>{assessment.statusLabel}</strong>
+                  </div>
+                  <div>
+                    <span>Lag</span>
+                    <strong>{formatLagMs(lag.lag_ms)}</strong>
+                  </div>
+                  <div>
+                    <span>Severity</span>
+                    <strong>{assessment.severityLabel}</strong>
+                  </div>
+                  <div>
+                    <span>Last processed position</span>
+                    <strong>#{lag.checkpoint_position}</strong>
+                  </div>
+                  <div>
+                    <span>Current state</span>
+                    <strong>{errorState}</strong>
+                  </div>
+                </div>
+                <p className="projection-note">{assessment.explanation}</p>
+                <div className="progress-track" aria-hidden="true">
+                  <span className="progress-fill" style={{ width: `${Math.max(6, ratio * 100)}%` }} />
+                </div>
+              </article>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+}
+
+function MCPResourcePanel(props: {
+  resourceUri: string;
+  onResourceUriChange: (value: string) => void;
+  onInspectResource: (target?: string) => void;
+  resourceBusy: boolean;
+  resourceQuickPicks: Array<{ label: string; uri: string }>;
+  resourceHistory: ResourceQueryHistoryEntry[];
+  resourceDefinitions: ResourceDefinition[];
+  resourceResult: string;
+}): ReactNode {
+  return (
+    <section className="panel mcp-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">MCP Query Output</p>
+          <h2>Resource inspector</h2>
+        </div>
+        <p className="section-note">Quick-select ledger resources and inspect raw responses.</p>
+      </div>
+
+      <div className="mcp-shell">
+        <div className="mcp-controls">
+          <label>
+            Resource URI
+            <input
+              value={props.resourceUri}
+              onChange={(event) => props.onResourceUriChange(event.target.value)}
+              placeholder="ledger://applications/app-.../compliance"
+            />
+          </label>
+          <div className="quick-actions">
+            <button className="button" onClick={() => props.onInspectResource()} disabled={props.resourceBusy}>
+              {props.resourceBusy ? "Loading resource..." : "Load resource"}
+            </button>
+          </div>
+          <div className="tag-list">
+            {props.resourceQuickPicks.map((item) => (
+              <button
+                type="button"
+                className="button subtle"
+                key={item.uri}
+                onClick={() => {
+                  props.onResourceUriChange(item.uri);
+                  props.onInspectResource(item.uri);
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          <details className="detail-block">
+            <summary>Resource catalogue ({props.resourceDefinitions.length})</summary>
+            <div className="mini-timeline resource-catalogue">
+              {props.resourceDefinitions.map((resource) => (
+                <button
+                  type="button"
+                  className="checkpoint-button"
+                  key={resource.uri}
+                  onClick={() => props.onResourceUriChange(resource.uri)}
+                >
+                  <span className="checkpoint-event">{resource.uri}</span>
+                  <span className="resource-description">{resource.description}</span>
+                </button>
+              ))}
+            </div>
+          </details>
+        </div>
+
+        <div className="mcp-results">
+          <div className="mcp-history">
+            <div className="panel-subhead">
+              <strong>Recent queries</strong>
+              <span>{props.resourceHistory.length}</span>
+            </div>
+            {props.resourceHistory.length === 0 ? (
+              <p className="empty-state">No MCP resource queries loaded yet.</p>
+            ) : (
+              <div className="mini-timeline resource-catalogue">
+                {props.resourceHistory.map((entry) => (
+                  <button
+                    type="button"
+                    className="checkpoint-button"
+                    key={`${entry.uri}-${entry.loadedAt}`}
+                    onClick={() => {
+                      props.onResourceUriChange(entry.uri);
+                      props.onInspectResource(entry.uri);
+                    }}
+                  >
+                    <span className="checkpoint-event">{entry.uri}</span>
+                    <span className="resource-description">{entry.preview}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="definition-list compact mcp-preview-grid">
+            <div>
+              <span>Last response preview</span>
+              <strong>{props.resourceHistory[0]?.preview ?? "Not loaded"}</strong>
+            </div>
+            <div>
+              <span>Most recent query</span>
+              <strong>{props.resourceHistory[0]?.uri ?? "Not loaded"}</strong>
+            </div>
+          </div>
+
+          <pre className="result-box">
+            {props.resourceResult || "Resource output appears here after loading a ledger URI."}
+          </pre>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CommandCenterPanel(props: {
+  busy: boolean;
+  applicationId: string;
+  role: string;
+  toolDefinitions: ToolDefinition[];
+  selectedTool: string;
+  onToolChange: (toolName: string) => void;
+  onRunDemo: () => void;
+  onPrepareTool: (toolName: string, overrides?: Record<string, unknown>) => void;
+  hasIntegrityCommand: boolean;
+  onRunCommand: () => void;
+  selectedToolDefinition: ToolDefinition | null;
+  commandPayload: string;
+  onCommandPayloadChange: (value: string) => void;
+  commandResult: string;
+}): ReactNode {
+  return (
+    <section className="panel command-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Command Center</p>
+          <h2>Controlled actions</h2>
+        </div>
+        <p className="section-note">Primary lifecycle actions are always visible.</p>
+      </div>
+
+      <div className="command-hero">
+        <button className="button primary command-primary" onClick={props.onRunDemo} disabled={props.busy}>
+          {props.busy ? "Working..." : "Run governed lifecycle"}
+        </button>
+        <div className="command-secondary">
+          <button
+            className="button subtle"
+            onClick={() =>
+              props.onPrepareTool("generate_decision", {
+                application_id: props.applicationId || "app-addis-001"
+              })
+            }
+          >
+            Queue decision command
+          </button>
+          {props.hasIntegrityCommand ? (
+            <button
+              className="button subtle"
+              onClick={() =>
+                props.onPrepareTool("run_integrity_check", {
+                  entity_type: "application",
+                  entity_id: props.applicationId || "app-addis-001",
+                  role: props.role
+                })
+              }
+            >
+              Queue integrity check
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      <details className="detail-block command-advanced">
+        <summary>Advanced controls</summary>
+        <div className="command-advanced-body">
+          <div className="command-builder">
+            <label>
+              Command
+              <select value={props.selectedTool} onChange={(event) => props.onToolChange(event.target.value)}>
+                {props.toolDefinitions.map((tool) => (
+                  <option value={tool.name} key={tool.name}>
+                    {tool.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="button"
+              onClick={props.onRunCommand}
+              disabled={props.busy || props.toolDefinitions.length === 0}
+            >
+              Execute command
+            </button>
+          </div>
+
+          <p className="field-note">{conciseDescription(props.selectedToolDefinition?.description)}</p>
+          <details className="detail-inline">
+            <summary>Command guidance</summary>
+            <p className="field-note">
+              {props.selectedToolDefinition?.description ?? "No commands available for this role."}
+            </p>
+          </details>
+          <details className="detail-block">
+            <summary>Advanced payload editor</summary>
+            <label>
+              JSON payload
+              <textarea
+                className="code-area"
+                value={props.commandPayload}
+                onChange={(event) => props.onCommandPayloadChange(event.target.value)}
+                rows={10}
+              />
+            </label>
+          </details>
+          <details className="detail-block">
+            <summary>Command receipt</summary>
+            <pre className="result-box">
+              {props.commandResult || "Command result appears here after execution."}
+            </pre>
+          </details>
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function AuditPhaseTimeline(props: {
+  timelineGroups: TimelineGroup[];
+  collapsedTimelineGroups: Record<string, boolean>;
+  onToggleGroup: (key: string, nextValue: boolean) => void;
+  eventTypeFilter: string;
+  onEventTypeFilterChange: (value: string) => void;
+  lineageEventTypes: string[];
+  eventActorFilter: string;
+  onEventActorFilterChange: (value: string) => void;
+  lineageActors: string[];
+  eventTimeRange: EventTimeRange;
+  onEventTimeRangeChange: (value: EventTimeRange) => void;
+  onResetFilters: () => void;
+  filteredCount: number;
+  applicationId: string;
+  showMetadata: boolean;
+  onToggleMetadata: () => void;
+}): ReactNode {
+  return (
+    <section className="panel lineage-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Event Evidence Timeline</p>
+          <h2>Phase-grouped audit flow</h2>
+        </div>
+        <div className="panel-actions">
+          <p className="section-note">{props.filteredCount} filtered events</p>
+          <button type="button" className="text-button" onClick={props.onToggleMetadata}>
+            {props.showMetadata ? "Hide metadata" : "Show metadata"}
+          </button>
+        </div>
+      </div>
+
+      <div className="timeline-toolbar">
+        <label>
+          Event type
+          <select value={props.eventTypeFilter} onChange={(event) => props.onEventTypeFilterChange(event.target.value)}>
+            <option value="all">All event types</option>
+            {props.lineageEventTypes.map((eventType) => (
+              <option key={eventType} value={eventType}>
+                {titleize(eventType)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Actor / agent
+          <select value={props.eventActorFilter} onChange={(event) => props.onEventActorFilterChange(event.target.value)}>
+            <option value="all">All actors</option>
+            {props.lineageActors.map((actor) => (
+              <option key={actor} value={actor}>
+                {actor}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Time range
+          <select
+            value={props.eventTimeRange}
+            onChange={(event) => props.onEventTimeRangeChange(event.target.value as EventTimeRange)}
+          >
+            <option value="all">All time</option>
+            <option value="1h">Last 1 hour</option>
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+          </select>
+        </label>
+        <button type="button" className="button subtle" onClick={props.onResetFilters}>
+          Reset filters
+        </button>
+      </div>
+
+      {props.timelineGroups.length === 0 ? (
+        <p className="empty-state">No lineage for the current filter scope.</p>
+      ) : (
+        <div className="phase-stack">
+          {props.timelineGroups.map((group) => {
+            const isCollapsed = props.collapsedTimelineGroups[group.key] ?? false;
+            const latestItem = group.items[group.items.length - 1];
+
+            return (
+              <section className="phase-group" key={group.key}>
+                <div className="phase-header">
+                  <div>
+                    <span className="phase-label">{group.phase}</span>
+                    <strong>{group.items.length} event{group.items.length === 1 ? "" : "s"}</strong>
+                  </div>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => props.onToggleGroup(group.key, !isCollapsed)}
+                  >
+                    {isCollapsed ? "Expand phase" : "Collapse phase"}
+                  </button>
+                </div>
+
+                {isCollapsed ? (
+                  <button
+                    type="button"
+                    className={`phase-collapsed ${isFinalDecisionEvent(latestItem.eventType) ? "phase-collapsed-final" : ""}`}
+                    onClick={() => props.onToggleGroup(group.key, false)}
+                  >
+                    <div className="phase-collapsed-main">
+                      <strong>{titleize(latestItem.eventType)}</strong>
+                      <span>{latestItem.actor}</span>
+                    </div>
+                    <span>{prettyDate(latestItem.recordedAt)}</span>
+                  </button>
+                ) : (
+                  <div className="lineage-list">
+                    {group.items.map((item) => (
+                      <article
+                        className={`lineage-item ${isFinalDecisionEvent(item.eventType) ? "final-decision" : ""}`}
+                        key={item.key}
+                      >
+                        <div className={`lineage-node tone-${item.tone}`} aria-hidden="true" />
+                        <div className="lineage-content">
+                          <div className="lineage-header">
+                            <div>
+                              <span className="lineage-lane">{item.lane}</span>
+                              <h3>{titleize(item.eventType)}</h3>
+                            </div>
+                            <StatusBadge label={prettyDate(item.recordedAt)} tone={item.tone} />
+                          </div>
+                          <div className="lineage-meta">
+                            <span>{item.actor}</span>
+                            <span>{props.applicationId || "No application selected"}</span>
+                            <span>{item.checkpoint}</span>
+                          </div>
+                          <p className="lineage-summary">{item.summary}</p>
+                          {props.showMetadata ? (
+                            <div className="evidence-inline">
+                              <span className="meta-label">Event metadata</span>
+                              <div className="lineage-evidence">
+                                <span>Stream {item.streamId}</span>
+                                <span>Position #{item.globalPosition}</span>
+                                <span>Correlation {shortId(item.correlationId)}</span>
+                                <span>Causation {shortId(item.causationId)}</span>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function EventCoveragePanel(props: {
+  applicationId: string;
+  observedEventTypes: string[];
+}): ReactNode {
+  const observedSet = new Set(props.observedEventTypes);
+  const expectedSet = new Set(EXPECTED_EVENT_TYPES);
+  const missingTypes = EXPECTED_EVENT_TYPES.filter((eventType) => !observedSet.has(eventType));
+  const unexpectedTypes = props.observedEventTypes.filter((eventType) => !expectedSet.has(eventType));
+
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">Coverage Check</p>
+          <h2>Event catalogue coverage</h2>
+        </div>
+        <p className="section-note">
+          {props.applicationId ? props.applicationId : "No focused application"}
+        </p>
+      </div>
+
+      {!props.applicationId ? (
+        <p className="empty-state">Select an application to compare expected and observed events.</p>
+      ) : (
+        <>
+          <div className="definition-list compact">
+            <div>
+              <span>Expected event types</span>
+              <strong>{EXPECTED_EVENT_TYPES.length}</strong>
+            </div>
+            <div>
+              <span>Observed event types</span>
+              <strong>{props.observedEventTypes.length}</strong>
+            </div>
+            <div>
+              <span>Missing event types</span>
+              <strong>{missingTypes.length}</strong>
+            </div>
+            <div>
+              <span>Unexpected event types</span>
+              <strong>{unexpectedTypes.length}</strong>
+            </div>
+          </div>
+
+          <div className="projection-list">
+            {EXPECTED_EVENT_GROUPS.map((group) => {
+              const groupObserved = group.eventTypes.filter((eventType) => observedSet.has(eventType));
+              const groupMissing = group.eventTypes.filter((eventType) => !observedSet.has(eventType));
+              const tone: Tone =
+                groupMissing.length === 0
+                  ? "ok"
+                  : groupObserved.length > 0
+                    ? "warning"
+                    : "critical";
+              return (
+                <article className={`projection-row projection-${tone}`} key={group.label}>
+                  <div className="projection-head">
+                    <strong>{group.label}</strong>
+                    <StatusBadge
+                      label={`${groupObserved.length}/${group.eventTypes.length} observed`}
+                      tone={tone}
+                    />
+                  </div>
+                  <p className="projection-note">
+                    {groupMissing.length === 0
+                      ? "All expected events observed."
+                      : `Missing: ${groupMissing.map((eventType) => titleize(eventType)).join(", ")}`}
+                  </p>
+                </article>
+              );
+            })}
+          </div>
+
+          {unexpectedTypes.length > 0 ? (
+            <div className="evidence-inline">
+              <span className="meta-label">Observed outside catalogue</span>
+              <p className="field-note">
+                {unexpectedTypes.map((eventType) => titleize(eventType)).join(", ")}
+              </p>
+            </div>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
 }
 
 function countFailedChecks(snapshot: Record<string, unknown> | null | undefined): number {
@@ -556,15 +1535,17 @@ function assessProjection(lag: {
     if (normalized.includes("critical") || normalized.includes("warning") || lag.lag_ms > 300_000) {
       return {
         tone: "warning",
-        label: "Synced",
-        helper: "No backlog; projection timer is elevated.",
+        statusLabel: "Synced with warning",
+        severityLabel: normalized.includes("critical") || lag.lag_ms > 300_000 ? "Critical lag" : "Warning lag",
+        explanation: "No backlog; projection timer elevated.",
         isSynced: true
       };
     }
     return {
       tone: "ok",
-      label: "Synced",
-      helper: "Projection is up to date.",
+      statusLabel: "Synced",
+      severityLabel: "Healthy",
+      explanation: "Projection is up to date.",
       isSynced: true
     };
   }
@@ -572,16 +1553,18 @@ function assessProjection(lag: {
   if (lag.events_behind <= 5) {
     return {
       tone: "warning",
-      label: "Backlog",
-      helper: `${lag.events_behind} events pending projection.`,
+      statusLabel: "Backlog",
+      severityLabel: "Warning",
+      explanation: `${lag.events_behind} events pending projection.`,
       isSynced: false
     };
   }
 
   return {
     tone: "critical",
-    label: "Backlog",
-    helper: `${lag.events_behind} events pending projection.`,
+    statusLabel: "Backlog",
+    severityLabel: "Critical",
+    explanation: `${lag.events_behind} events pending projection.`,
     isSynced: false
   };
 }
@@ -611,16 +1594,29 @@ export default function App() {
   const [agentPerformance, setAgentPerformance] = useState<AgentPerformance | null>(null);
   const [health, setHealth] = useState<LedgerHealth | null>(null);
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
+  const [applicationEvents, setApplicationEvents] = useState<RecentEvent[]>([]);
   const [integrityTrail, setIntegrityTrail] = useState<RecentEvent[]>([]);
   const [auditRows, setAuditRows] = useState<AuthAuditRow[]>([]);
+  const [resourceDefinitions, setResourceDefinitions] = useState<ResourceDefinition[]>([]);
+  const [resourceUri, setResourceUri] = useState<string>("ledger://ledger/health");
+  const [resourceResult, setResourceResult] = useState<string>("");
+  const [resourceBusy, setResourceBusy] = useState<boolean>(false);
+  const [resourceHistory, setResourceHistory] = useState<ResourceQueryHistoryEntry[]>([]);
+  const [sessionIdInput, setSessionIdInput] = useState<string>("");
+  const [sessionReplay, setSessionReplay] = useState<AgentSessionReplay | null>(null);
+  const [sessionReplayBusy, setSessionReplayBusy] = useState<boolean>(false);
+  const [lastIntegrityCheckResult, setLastIntegrityCheckResult] = useState<Record<string, unknown> | null>(null);
+  const [eventTypeFilter, setEventTypeFilter] = useState<string>("all");
+  const [eventActorFilter, setEventActorFilter] = useState<string>("all");
+  const [eventTimeRange, setEventTimeRange] = useState<EventTimeRange>("all");
+  const [collapsedTimelineGroups, setCollapsedTimelineGroups] = useState<Record<string, boolean>>({});
 
   const [busy, setBusy] = useState<boolean>(false);
   const [temporalBusy, setTemporalBusy] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>("");
+  const [noticeToastVisible, setNoticeToastVisible] = useState<boolean>(true);
   const [lastRefresh, setLastRefresh] = useState<string>(new Date().toISOString());
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("operations");
-  const [showAllLineage, setShowAllLineage] = useState<boolean>(false);
-  const [showAllActivity, setShowAllActivity] = useState<boolean>(false);
   const [evidencePanels, setEvidencePanels] = useState<Record<EvidencePanelKey, boolean>>({
     integrity: false,
     snapshot: false,
@@ -635,6 +1631,94 @@ export default function App() {
     }
     return Object.entries(health.projections);
   }, [health]);
+
+  const sessionCandidates = useMemo(() => {
+    const currentAgentId = agentId.trim();
+    const currentApplicationId = applicationId.trim();
+    const sourceEvents = currentApplicationId ? applicationEvents : recentEvents;
+    const seen = new Set<string>();
+    const candidates: string[] = [];
+
+    for (const event of sourceEvents) {
+      const payload = readRecord(event.payload);
+      const candidate = extractSessionId(event);
+      if (!candidate || seen.has(candidate)) {
+        continue;
+      }
+
+      const payloadAgentId = readString(payload.agent_id);
+      if (
+        currentAgentId &&
+        payloadAgentId &&
+        payloadAgentId !== currentAgentId
+      ) {
+        continue;
+      }
+      if (
+        currentAgentId &&
+        !payloadAgentId &&
+        !event.stream_id.includes(`agent-${currentAgentId}-`)
+      ) {
+        continue;
+      }
+
+      const payloadApplicationId = readString(payload.application_id);
+      if (
+        currentApplicationId &&
+        payloadApplicationId &&
+        payloadApplicationId !== currentApplicationId
+      ) {
+        continue;
+      }
+
+      seen.add(candidate);
+      candidates.push(candidate);
+    }
+
+    return candidates.slice(0, 10);
+  }, [agentId, applicationEvents, applicationId, recentEvents]);
+
+  const resourceQuickPicks = useMemo(() => {
+    const picks: Array<{ label: string; uri: string }> = [
+      { label: "Ledger Health", uri: "ledger://ledger/health" }
+    ];
+    const focusApplicationId = applicationId.trim();
+    const focusAgentId = agentId.trim();
+    const focusSessionId = sessionIdInput.trim() || sessionCandidates[0];
+
+    if (focusApplicationId) {
+      picks.push(
+        {
+          label: "Application Summary",
+          uri: `ledger://applications/${focusApplicationId}`
+        },
+        {
+          label: "Compliance (current)",
+          uri: `ledger://applications/${focusApplicationId}/compliance`
+        },
+        {
+          label: "Audit Trail",
+          uri: `ledger://applications/${focusApplicationId}/audit-trail`
+        }
+      );
+    }
+
+    if (focusAgentId) {
+      picks.push({
+        label: "Agent Performance",
+        uri: `ledger://agents/${focusAgentId}/performance`
+      });
+    }
+
+    if (focusAgentId && focusSessionId) {
+      picks.push({
+        label: "Agent Session Replay",
+        uri: `ledger://agents/${focusAgentId}/sessions/${focusSessionId}`
+      });
+    }
+
+    return picks;
+  }, [agentId, applicationId, sessionCandidates, sessionIdInput]);
 
   const canViewAudit = useMemo(() => {
     return authUser?.role === "compliance" || authUser?.role === "admin";
@@ -691,9 +1775,7 @@ export default function App() {
   }, [applications]);
 
   const applicationLineage = useMemo(() => {
-    const rows = recentEvents
-      .filter((event) => eventMatchesApplication(event, applicationId))
-      .map(buildLineageItemFromRecent);
+    const rows = applicationEvents.map(buildLineageItemFromRecent);
 
     const complianceRows = (compliance?.timeline ?? []).map(buildLineageItemFromCompliance);
     const deduped = new Map<string, LineageItem>();
@@ -703,27 +1785,96 @@ export default function App() {
     });
 
     return Array.from(deduped.values()).sort((left, right) => left.globalPosition - right.globalPosition);
-  }, [applicationId, compliance, recentEvents]);
+  }, [applicationEvents, compliance]);
+
+  const lineageEventTypes = useMemo(() => {
+    return Array.from(new Set(applicationLineage.map((item) => item.eventType))).sort();
+  }, [applicationLineage]);
+
+  const lineageActors = useMemo(() => {
+    return Array.from(new Set(applicationLineage.map((item) => item.actor))).sort();
+  }, [applicationLineage]);
+
+  const filteredLineage = useMemo(() => {
+    return applicationLineage.filter((item) => {
+      if (eventTypeFilter !== "all" && item.eventType !== eventTypeFilter) {
+        return false;
+      }
+      if (eventActorFilter !== "all" && item.actor !== eventActorFilter) {
+        return false;
+      }
+      if (!matchesTimeRange(item.recordedAt, eventTimeRange)) {
+        return false;
+      }
+      return true;
+    });
+  }, [applicationLineage, eventActorFilter, eventTimeRange, eventTypeFilter]);
+
+  const timelineGroups = useMemo(() => {
+    const groups: TimelineGroup[] = [];
+    for (const item of filteredLineage) {
+      const phase = eventPhase(item.eventType);
+      const current = groups[groups.length - 1];
+      if (!current || current.phase !== phase) {
+        groups.push({
+          key: `${phase}-${item.globalPosition}`,
+          phase,
+          items: [item]
+        });
+        continue;
+      }
+      current.items.push(item);
+    }
+    return groups;
+  }, [filteredLineage]);
 
   const integritySummary = useMemo(() => {
     const latest = integrityTrail[integrityTrail.length - 1] ?? null;
     const verifiedCount = readNumber(latest?.payload.events_verified_count);
     const integrityHash = readString(latest?.payload.integrity_hash);
-    const tone = latest ? "ok" : applicationId ? "warning" : "neutral";
+    const chainValid = typeof lastIntegrityCheckResult?.chain_valid === "boolean" ? lastIntegrityCheckResult.chain_valid : null;
+    const violationCount = readNumber(lastIntegrityCheckResult?.violation_count);
+    const tone =
+      chainValid === false
+        ? "critical"
+        : latest
+          ? "ok"
+          : applicationId
+            ? "warning"
+            : "neutral";
 
     return {
       tone: tone as Tone,
-      status: latest ? "Verified" : applicationId ? "Pending verification" : "No focal application",
-      tamperState: latest
-        ? "No tamper evidence recorded in the latest chain run."
-        : "Not yet evaluated for this focus. Run integrity check to attest the chain.",
+      status:
+        chainValid === false
+          ? "Failed verification"
+          : latest
+            ? "Verified"
+            : applicationId
+              ? "Pending verification"
+              : "No focal application",
+      tamperState:
+        chainValid === false
+          ? `${violationCount ?? 0} integrity violation${violationCount === 1 ? "" : "s"} detected in the latest chain run.`
+          : latest
+            ? "No tamper evidence recorded in the latest chain run."
+            : "Not yet evaluated for this focus. Run integrity check to attest the chain.",
       verifiedWindow: latest
         ? `${verifiedCount ?? 0} events sealed in latest verification`
         : "No verification window recorded",
       evidenceHash: integrityHash ? shortId(integrityHash, 8) : "Unavailable",
       verifiedAt: latest ? prettyDate(latest.recorded_at) : "Not yet verified"
     };
-  }, [applicationId, integrityTrail]);
+  }, [applicationId, integrityTrail, lastIntegrityCheckResult]);
+
+  const integrityCoverage = useMemo(() => {
+    const verified = readNumber(integrityTrail[integrityTrail.length - 1]?.payload.events_verified_count) ?? 0;
+    const total = applicationLineage.length;
+    return {
+      verified,
+      total
+    };
+  }, [applicationLineage.length, integrityTrail]);
 
   const temporalDelta = useMemo(() => {
     const currentStatus =
@@ -741,19 +1892,115 @@ export default function App() {
   }, [application, compliance, temporalCompliance]);
 
   const fabricRows = useMemo(() => {
+    const scopedOperationalEvents = applicationId
+      ? [...applicationLineage]
+          .sort((left, right) => right.globalPosition - left.globalPosition)
+          .map((item) => ({
+            event_type: item.eventType,
+            recorded_at: item.recordedAt
+          }))
+      : recentEvents.map((event) => ({
+          event_type: event.event_type,
+          recorded_at: event.recorded_at
+        }));
+
     return OPERATING_FABRIC.map((agent) => {
-      const observedEvent = recentEvents.find((event) =>
+      const observedEvent = scopedOperationalEvents.find((event) =>
         agent.eventTypes.some((eventType) => eventType === event.event_type)
       );
+      const latestEventType = observedEvent?.event_type ?? null;
+      const isCompleted =
+        latestEventType === "CreditAnalysisCompleted" ||
+        latestEventType === "FraudScreeningCompleted" ||
+        latestEventType === "ComplianceCheckCompleted" ||
+        latestEventType === "DecisionGenerated" ||
+        latestEventType === "HumanReviewRequested";
+      const isInProgress = Boolean(observedEvent && !isCompleted);
       return {
         ...agent,
-        status: observedEvent ? "Live" : "Waiting",
+        status: isCompleted ? "Complete" : isInProgress ? "Live" : "Pending",
         latestEvent: observedEvent ? titleize(observedEvent.event_type) : "No event",
         latestAt: observedEvent ? prettyDate(observedEvent.recorded_at) : "No timestamp",
-        tone: observedEvent ? ("ok" as Tone) : ("neutral" as Tone)
+        tone: isCompleted ? ("ok" as Tone) : isInProgress ? ("info" as Tone) : ("warning" as Tone)
       };
     });
-  }, [recentEvents]);
+  }, [applicationId, applicationLineage, recentEvents]);
+
+  const humanReviewState = useMemo(() => {
+    const hasHumanReviewRequested = applicationLineage.some((item) => item.eventType === "HumanReviewRequested");
+    const hasHumanReviewCompleted = applicationLineage.some(
+      (item) =>
+        item.eventType === "HumanReviewCompleted" ||
+        item.eventType === "ApplicationApproved" ||
+        item.eventType === "ApplicationDeclined"
+    );
+    const latestHumanReviewEvent = [...applicationLineage]
+      .reverse()
+      .find((item) =>
+        item.eventType === "HumanReviewRequested" ||
+        item.eventType === "HumanReviewCompleted" ||
+        item.eventType === "ApplicationApproved" ||
+        item.eventType === "ApplicationDeclined"
+      );
+
+    if (application?.final_decision || hasHumanReviewCompleted) {
+      const derivedDecision =
+        application?.final_decision ??
+        (latestHumanReviewEvent?.eventType === "ApplicationApproved"
+          ? "approved"
+          : latestHumanReviewEvent?.eventType === "ApplicationDeclined"
+            ? "declined"
+            : "completed");
+      return {
+        label: "Complete",
+        tone: "ok" as Tone,
+        detail: titleize(derivedDecision),
+        timestamp: latestHumanReviewEvent?.recordedAt ?? application?.updated_at ?? null
+      };
+    }
+
+    if (hasHumanReviewRequested) {
+      return {
+        label: "Pending",
+        tone: "warning" as Tone,
+        detail: "Awaiting officer review",
+        timestamp: latestHumanReviewEvent?.recordedAt ?? null
+      };
+    }
+
+    return {
+      label: "Not requested",
+      tone: "neutral" as Tone,
+      detail: "Review not requested yet",
+      timestamp: null
+    };
+  }, [application?.final_decision, application?.updated_at, applicationLineage]);
+
+  const pipelineStages = useMemo(() => {
+    const humanStageStatus =
+      humanReviewState.label === "Complete"
+        ? "Complete"
+        : humanReviewState.label === "Pending"
+          ? "Live"
+          : "Pending";
+
+    return [
+      ...fabricRows,
+      {
+        name: "HumanReview",
+        role: "Binding human decision",
+        status: humanStageStatus,
+        latestEvent: humanReviewState.detail,
+        latestAt: humanReviewState.timestamp ? prettyDate(humanReviewState.timestamp) : "No timestamp",
+        tone:
+          humanReviewState.label === "Complete"
+            ? ("ok" as Tone)
+            : humanReviewState.label === "Pending"
+              ? ("info" as Tone)
+              : ("warning" as Tone)
+      }
+    ];
+  }, [fabricRows, humanReviewState]);
 
   const currentComplianceSnapshot = readRecord(compliance?.snapshot);
   const temporalSnapshot = readRecord(temporalCompliance?.snapshot);
@@ -763,28 +2010,14 @@ export default function App() {
   const primaryPipelineState = states[0];
   const isOperationsView = workspaceMode === "operations";
   const isAuditView = workspaceMode === "audit";
+  const isSystemView = workspaceMode === "system";
   const allEvidenceExpanded = useMemo(() => {
     return EVIDENCE_PANEL_KEYS.every((panel) => evidencePanels[panel]);
   }, [evidencePanels]);
-  const lineageDefaultCount = 4;
-  const activityDefaultCount = 5;
   const activityMaxCount = 16;
   const activityWindow = recentEvents.slice(0, activityMaxCount);
-  const lineageTotalCount = applicationLineage.length;
-  const activityTotalCount = activityWindow.length;
-  const visibleLineage =
-    isOperationsView
-      ? showAllLineage
-        ? applicationLineage
-        : applicationLineage.slice(-lineageDefaultCount)
-      : applicationLineage;
-  const visibleActivity =
-    isOperationsView
-      ? showAllActivity
-        ? activityWindow
-        : activityWindow.slice(0, activityDefaultCount)
-      : activityWindow;
-  const applicationRegisterLimit = isOperationsView ? 6 : 12;
+  const visibleActivity = activityWindow;
+  const applicationRegisterLimit = isOperationsView ? 10 : 12;
   const visibleApplicationRows = applications.slice(0, applicationRegisterLimit);
   const replayCheckpointCount = isOperationsView ? 3 : 6;
 
@@ -806,10 +2039,17 @@ export default function App() {
     clearStoredToken();
     setAuthUser(null);
     setToolDefinitions([]);
+    setResourceDefinitions([]);
+    setResourceResult("");
+    setResourceHistory([]);
     setCommandResult("");
+    setLastIntegrityCheckResult(null);
     setAuditRows([]);
+    setApplicationEvents([]);
     setIntegrityTrail([]);
     setTemporalCompliance(null);
+    setSessionReplay(null);
+    setSessionIdInput("");
     setNotice(reason ?? "Logged out.");
   }, []);
 
@@ -830,6 +2070,7 @@ export default function App() {
                 // Focused app no longer exists (stale UI state). Clear focus so auto-pick logic can recover.
                 setApplicationId("");
                 setApplication(null);
+                setApplicationEvents([]);
                 setCompliance(null);
                 setTemporalCompliance(null);
                 setIntegrityTrail([]);
@@ -838,6 +2079,8 @@ export default function App() {
               throw error;
             }
             setApplication(nextApplication);
+            const nextAppEvents = await fetchApplicationEvents(focusApplicationId, 5000);
+            setApplicationEvents(nextAppEvents);
 
             try {
               const trail = await fetchApplicationAuditTrail(focusApplicationId);
@@ -867,6 +2110,8 @@ export default function App() {
             }
           })()
         );
+      } else {
+        setApplicationEvents([]);
       }
 
       if (focusAgentId) {
@@ -887,12 +2132,13 @@ export default function App() {
   );
 
   const refreshGlobal = useCallback(async () => {
-    const [nextStates, nextApps, nextHealth, nextEvents, nextTools] = await Promise.all([
+    const [nextStates, nextApps, nextHealth, nextEvents, nextTools, nextResources] = await Promise.all([
       fetchApplicationStates(),
       fetchApplications(40),
       fetchLedgerHealth(),
       fetchRecentEvents(60),
-      fetchTools()
+      fetchTools(),
+      fetchResources()
     ]);
 
     setStates(nextStates);
@@ -900,6 +2146,7 @@ export default function App() {
     setHealth(nextHealth);
     setRecentEvents(nextEvents);
     setToolDefinitions(nextTools);
+    setResourceDefinitions(nextResources);
 
     if (nextTools.length > 0 && !nextTools.some((item) => item.name === selectedTool)) {
       const nextTool = nextTools[0].name;
@@ -959,8 +2206,6 @@ export default function App() {
     }
     setWorkspaceMode("operations");
     setAllEvidencePanels(false);
-    setShowAllLineage(false);
-    setShowAllActivity(false);
   }, [authUser, setAllEvidencePanels]);
 
   useEffect(() => {
@@ -997,12 +2242,32 @@ export default function App() {
   }, [compliance, temporalAsOf]);
 
   useEffect(() => {
-    setShowAllLineage(false);
-    setShowAllActivity(false);
+    if (sessionIdInput || sessionCandidates.length === 0) {
+      return;
+    }
+    setSessionIdInput(sessionCandidates[0]);
+  }, [sessionCandidates, sessionIdInput]);
+
+  useEffect(() => {
+    setCollapsedTimelineGroups({});
+  }, [applicationId, eventActorFilter, eventTimeRange, eventTypeFilter]);
+
+  useEffect(() => {
     if (workspaceMode === "operations") {
       setAllEvidencePanels(false);
     }
   }, [applicationId, setAllEvidencePanels, workspaceMode]);
+
+  useEffect(() => {
+    if (!notice) {
+      return;
+    }
+    setNoticeToastVisible(true);
+    const timer = window.setTimeout(() => {
+      setNoticeToastVisible(false);
+    }, 5500);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1033,9 +2298,21 @@ export default function App() {
 
   async function handleRunDemo() {
     setBusy(true);
-    setNotice("Running governed lifecycle scenario...");
+    const requestedApplicationId = applicationId.trim() || undefined;
+    const requestedIdExists = Boolean(
+      requestedApplicationId &&
+        applications.some((item) => item.application_id === requestedApplicationId)
+    );
+    const targetApplicationId = requestedIdExists ? undefined : requestedApplicationId;
+    setNotice(
+      targetApplicationId
+        ? `Running governed lifecycle scenario for ${targetApplicationId}...`
+        : requestedIdExists
+          ? `Application ${requestedApplicationId} already exists. Running governed lifecycle with a new generated ID...`
+        : "Running governed lifecycle scenario..."
+    );
     try {
-      const result = await bootstrapDemo();
+      const result = await bootstrapDemo(targetApplicationId);
       const nextApplicationId = String(result.application_id ?? "");
       const nextAgentId = String(result.agent_id ?? "");
       if (nextApplicationId) {
@@ -1064,12 +2341,16 @@ export default function App() {
 
   async function handleRunCommand() {
     setBusy(true);
+    setCommandResult("");
     setNotice(`Submitting ${selectedTool} to the write-side command surface...`);
 
     try {
       const parsed = JSON.parse(commandPayload) as Record<string, unknown>;
       const result = await runCommand(selectedTool, parsed);
       setCommandResult(JSON.stringify(result, null, 2));
+      if (selectedTool === "run_integrity_check") {
+        setLastIntegrityCheckResult(result);
+      }
 
       const nextApplicationId =
         readString(parsed.application_id) ??
@@ -1089,17 +2370,114 @@ export default function App() {
       await refreshFocused(nextApplicationId, nextAgentId);
     } catch (error) {
       if (isAuthFailure(error)) {
+        setCommandResult("");
         doLogout("Session expired. Please login again.");
         return;
       }
       if (error instanceof SyntaxError) {
+        setCommandResult(
+          JSON.stringify(
+            {
+              ok: false,
+              error: {
+                error_type: "InvalidJson",
+                message: "Payload editor contains invalid JSON."
+              }
+            },
+            null,
+            2
+          )
+        );
         setNotice("Invalid JSON in command payload.");
       } else if (error instanceof LedgerApiError) {
+        setCommandResult(
+          JSON.stringify(
+            {
+              ok: false,
+              error: {
+                error_type: error.errorType ?? "RequestError",
+                message: error.message,
+                suggested_action: error.suggestedAction ?? null,
+                status: error.status
+              }
+            },
+            null,
+            2
+          )
+        );
         setNotice(
           `${error.message}${error.suggestedAction ? ` | Try: ${error.suggestedAction}` : ""}`
         );
       } else {
+        setCommandResult(
+          JSON.stringify(
+            {
+              ok: false,
+              error: {
+                error_type: "UnexpectedError",
+                message: "Command execution failed unexpectedly."
+              }
+            },
+            null,
+            2
+          )
+        );
         setNotice("Command execution failed unexpectedly.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRunVerification() {
+    const targetApplicationId = applicationId.trim();
+    if (!targetApplicationId || !hasIntegrityCommand) {
+      setNotice("Choose an application with verification access before running verification.");
+      return;
+    }
+
+    const payload = {
+      entity_type: "application",
+      entity_id: targetApplicationId,
+      role: authUser?.role ?? "admin"
+    };
+
+    setBusy(true);
+    setSelectedTool("run_integrity_check");
+    setCommandPayload(JSON.stringify(payload, null, 2));
+    setNotice(`Running integrity verification for ${targetApplicationId}...`);
+
+    try {
+      const result = await runCommand("run_integrity_check", payload);
+      setCommandResult(JSON.stringify(result, null, 2));
+      setLastIntegrityCheckResult(result);
+      setNotice(`Integrity verification completed for ${targetApplicationId}.`);
+      await refreshGlobal();
+      await refreshFocused(targetApplicationId, agentId);
+    } catch (error) {
+      if (isAuthFailure(error)) {
+        doLogout("Session expired. Please login again.");
+        return;
+      }
+      if (error instanceof LedgerApiError) {
+        setCommandResult(
+          JSON.stringify(
+            {
+              ok: false,
+              error: {
+                error_type: error.errorType ?? "RequestError",
+                message: error.message,
+                suggested_action: error.suggestedAction ?? null,
+                status: error.status
+              }
+            },
+            null,
+            2
+          )
+        );
+        setNotice(`Verification failed: ${error.message}`);
+      } else {
+        setNotice("Verification failed unexpectedly.");
       }
     } finally {
       setBusy(false);
@@ -1109,12 +2487,14 @@ export default function App() {
   function handleToolChange(nextTool: string) {
     setSelectedTool(nextTool);
     setCommandPayload(JSON.stringify(commandSeed(nextTool, applicationId, authUser?.role), null, 2));
+    setCommandResult("");
   }
 
   function prepareTool(toolName: string, overrides?: Record<string, unknown>) {
     const nextPayload = { ...commandSeed(toolName, applicationId, authUser?.role), ...overrides };
     setSelectedTool(toolName);
     setCommandPayload(JSON.stringify(nextPayload, null, 2));
+    setCommandResult("");
   }
 
   async function handleTemporalInspect() {
@@ -1144,10 +2524,99 @@ export default function App() {
     }
   }
 
+  async function handleLoadSessionReplay() {
+    const focusAgentId = agentId.trim();
+    const focusSessionId = sessionIdInput.trim();
+    if (!focusAgentId || !focusSessionId) {
+      setNotice("Set both Agent ID and Session ID before loading replay.");
+      return;
+    }
+
+    setSessionReplayBusy(true);
+    try {
+      const replay = await fetchAgentSession(focusAgentId, focusSessionId);
+      setSessionReplay(replay);
+      setNotice(`Session replay loaded for ${focusSessionId}.`);
+    } catch (error) {
+      if (isAuthFailure(error)) {
+        doLogout("Session expired. Please login again.");
+        return;
+      }
+      setSessionReplay(null);
+      if (error instanceof LedgerApiError) {
+        setNotice(`Session replay failed: ${error.message}`);
+      } else {
+        setNotice("Session replay failed unexpectedly.");
+      }
+    } finally {
+      setSessionReplayBusy(false);
+    }
+  }
+
+  async function handleInspectResource(target?: string) {
+    const candidate = (target ?? resourceUri).trim();
+    if (!candidate) {
+      setNotice("Enter a resource URI first.");
+      return;
+    }
+
+    setResourceBusy(true);
+    try {
+      const payload = await fetchResourceByUri(candidate);
+      const preview = previewJson(payload);
+      setResourceUri(candidate);
+      setResourceResult(JSON.stringify(payload, null, 2));
+      setResourceHistory((current) => [
+        {
+          uri: candidate,
+          preview,
+          loadedAt: new Date().toISOString()
+        },
+        ...current.filter((entry) => entry.uri !== candidate)
+      ].slice(0, 6));
+      setNotice(`Resource loaded: ${candidate}`);
+    } catch (error) {
+      if (isAuthFailure(error)) {
+        doLogout("Session expired. Please login again.");
+        return;
+      }
+      if (error instanceof LedgerApiError) {
+        setResourceResult(
+          JSON.stringify(
+            {
+              ok: false,
+              error: {
+                error_type: error.errorType ?? "RequestError",
+                message: error.message,
+                suggested_action: error.suggestedAction ?? null
+              }
+            },
+            null,
+            2
+          )
+        );
+        setResourceHistory((current) => [
+          {
+            uri: candidate,
+            preview: error.message,
+            loadedAt: new Date().toISOString()
+          },
+          ...current.filter((entry) => entry.uri !== candidate)
+        ].slice(0, 6));
+        setNotice(`Resource load failed: ${error.message}`);
+      } else {
+        setNotice("Resource load failed unexpectedly.");
+      }
+    } finally {
+      setResourceBusy(false);
+    }
+  }
+
   async function handleSelectApplication(nextApplicationId: string) {
     setApplicationId(nextApplicationId);
     setTemporalCompliance(null);
     setTemporalAsOf("");
+    setSessionReplay(null);
     try {
       await refreshFocused(nextApplicationId, agentId);
       setNotice(`Focused control record updated to ${nextApplicationId}.`);
@@ -1157,6 +2626,24 @@ export default function App() {
       } else {
         setNotice("Unable to update the focused application.");
       }
+    }
+  }
+
+  async function handleCopyApplicationId(targetApplicationId: string) {
+    const candidate = targetApplicationId.trim();
+    if (!candidate) {
+      setNotice("No application ID is available to copy.");
+      return;
+    }
+    if (!window.isSecureContext || !navigator.clipboard?.writeText) {
+      setNotice("Clipboard access is unavailable in this browser context.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(candidate);
+      setNotice(`Copied application ID: ${candidate}`);
+    } catch {
+      setNotice("Unable to copy application ID. Copy it manually from the tooltip.");
     }
   }
 
@@ -1231,32 +2718,38 @@ export default function App() {
           </div>
 
           <div className="identity-meta">
-            <div className="badge-row">
-              <StatusBadge label="Internal" tone="neutral" />
-              <StatusBadge label="RBAC active" tone="ok" />
-              <StatusBadge
-                label={`Projection ${projectionSummary.label}`}
-                tone={projectionSummary.tone}
-              />
+            <div className="identity-meta-top">
+              <div className="badge-row">
+                <StatusBadge label="Internal" tone="neutral" />
+                <StatusBadge label="RBAC active" tone="ok" />
+                <StatusBadge
+                  label={`Projection ${projectionSummary.label}`}
+                  tone={projectionSummary.tone}
+                />
+              </div>
+              <div className="meta-actions meta-actions-inline">
+                <button className="button subtle button-compact" onClick={() => void loadEverything()} disabled={busy}>
+                  Refresh
+                </button>
+                <button className="button button-compact" onClick={() => doLogout("Logged out.")}>
+                  Log Out
+                </button>
+              </div>
             </div>
-            <div className="meta-grid">
-              <div className="meta-item">
+            <div className="meta-strip">
+              <div className="meta-item meta-item-inline">
+                <span className="meta-label">System status</span>
+                <strong>{projectionSummary.label}</strong>
+              </div>
+              <div className="meta-item meta-item-inline">
                 <span className="meta-label">Last refresh</span>
                 <strong>{prettyDate(lastRefresh)}</strong>
               </div>
-              <div className="meta-item">
+              <div className="meta-item meta-item-inline">
                 <span className="meta-label">Session</span>
                 <strong>
                   {authUser.username} <span className="meta-inline">({authUser.role})</span>
                 </strong>
-              </div>
-              <div className="meta-actions">
-                <button className="button subtle" onClick={() => void loadEverything()} disabled={busy}>
-                  Refresh
-                </button>
-                <button className="button" onClick={() => doLogout("Logged out.")}>
-                  Log Out
-                </button>
               </div>
             </div>
           </div>
@@ -1298,30 +2791,42 @@ export default function App() {
           />
         </section>
 
-        <section className="panel workspace-nav">
-          <div>
+        <AgentPipelineFlow stages={pipelineStages} compact />
+
+        <section className="panel workspace-nav workspace-strip">
+          <div className="workspace-strip-main">
             <p className="section-kicker">Workspace</p>
-            <h2>The Ledger Workspace</h2>
-            <p className="section-note">
-              {workspaceMode === "operations"
-                ? "Operations focus active. Switch to Audit Depth for full evidence fields."
-                : "Audit depth active. Full evidence fields and metadata are visible."}
-            </p>
+            <h2
+              title={
+                isOperationsView
+                  ? "Operational view for focused applications, command execution, and pipeline progress."
+                  : isAuditView
+                    ? "Audit view for evidence, verification, and temporal reconstruction."
+                    : "System view for projections, MCP resources, and session replay."
+              }
+            >
+              The Ledger Workspace
+            </h2>
           </div>
-          <div className="detail-actions">
-            <div className="detail-level">
-              <span className="detail-label">Audit details</span>
-              <button
-                className={`toggle-btn ${isAuditView ? "active" : ""}`}
-                onClick={() => {
-                  setAllEvidencePanels(false);
-                  setWorkspaceMode(isAuditView ? "operations" : "audit");
-                }}
-                type="button"
-                aria-pressed={isAuditView}
-              >
-                {isAuditView ? "On" : "Off"}
-              </button>
+          <div className="workspace-controls">
+            <div className="workspace-tabs" role="tablist" aria-label="Ledger views">
+              {(["operations", "audit", "system"] as WorkspaceMode[]).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={workspaceMode === tab}
+                  className={`tab-button ${workspaceMode === tab ? "active" : ""}`}
+                  onClick={() => {
+                    setWorkspaceMode(tab);
+                    if (tab !== "audit") {
+                      setAllEvidencePanels(false);
+                    }
+                  }}
+                >
+                  {titleize(tab)}
+                </button>
+              ))}
             </div>
             {isAuditView ? (
               <button
@@ -1331,136 +2836,49 @@ export default function App() {
               >
                 {allEvidenceExpanded ? "Collapse all evidence" : "Expand all evidence"}
               </button>
-            ) : null}
-          </div>
-        </section>
-
-        <section className="panel operating-model">
-          <div className="panel-heading">
-            <div>
-              <p className="section-kicker">Decisioning Fabric</p>
-              <h2>Agent workflow</h2>
-            </div>
-            <p className="section-note">Machine flow plus binding human decision.</p>
-          </div>
-
-          <div className="fabric-rail">
-            {fabricRows.map((agent) => (
-              <article className="fabric-step" key={agent.name}>
-                <div className="fabric-header">
-                  <strong>{agent.name}</strong>
-                  <StatusBadge label={agent.status} tone={agent.tone} />
-                </div>
-                <span className="fabric-role">{agent.role}</span>
-                <div className="fabric-meta">
-                  <span>{agent.latestEvent}</span>
-                  <time>{agent.latestAt}</time>
-                </div>
-              </article>
-            ))}
-            <article className="fabric-step human-card">
-              <div className="fabric-header">
-                <strong>Human Loan Officer</strong>
-                <StatusBadge
-                  label={application?.final_decision ? "Complete" : "Pending"}
-                  tone={application?.final_decision ? "ok" : "warning"}
-                />
-              </div>
-              <span className="fabric-role">Final binding decision</span>
-              <div className="fabric-meta">
-                <span>{application?.final_decision ? titleize(application.final_decision) : "Awaiting officer review"}</span>
-                <time>{application?.updated_at ? prettyDate(application.updated_at) : "No timestamp"}</time>
-              </div>
-            </article>
-          </div>
-        </section>
-
-        <div className="workspace-grid">
-          <aside className="workspace-column left-column">
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Scenario Runner</p>
-                  <h2>Command center</h2>
-                </div>
-                <p className="section-note">Run controlled ledger commands.</p>
-              </div>
-
-              <div className="quick-actions">
-                <button className="button primary" onClick={() => void handleRunDemo()} disabled={busy}>
-                  {busy ? "Working..." : "Run governed lifecycle"}
-                </button>
-                <button
-                  className="button subtle"
-                  onClick={() =>
-                    prepareTool("generate_decision", {
-                      application_id: applicationId || "app-addis-001"
-                    })
-                  }
-                >
-                  Queue decision command
-                </button>
-                {hasIntegrityCommand ? (
-                  <button
-                    className="button subtle"
-                    onClick={() =>
-                      prepareTool("run_integrity_check", {
-                      entity_type: "application",
-                      entity_id: applicationId || "app-addis-001",
-                      role: authUser.role
-                    })
-                    }
-                  >
-                    Queue integrity check
-                  </button>
-                ) : null}
-              </div>
-
-              <label>
-                Command
-                <select value={selectedTool} onChange={(event) => handleToolChange(event.target.value)}>
-                  {toolDefinitions.map((tool) => (
-                    <option value={tool.name} key={tool.name}>
-                      {tool.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button className="button" onClick={() => void handleRunCommand()} disabled={busy || !toolDefinitions.length}>
-                Execute command
+            ) : (
+              <button
+                className="button subtle evidence-toggle workspace-action-placeholder"
+                type="button"
+                disabled
+                tabIndex={-1}
+                aria-hidden="true"
+              >
+                Expand all evidence
               </button>
-              <p className="field-note">{conciseDescription(selectedToolDefinition?.description)}</p>
-              <details className="detail-inline">
-                <summary>Command guidance</summary>
-                <p className="field-note">
-                  {selectedToolDefinition?.description ?? "No commands available for this role."}
-                </p>
-              </details>
-              <details className="detail-block">
-                <summary>Payload editor</summary>
-                <label>
-                  JSON payload
-                  <textarea
-                    className="code-area"
-                    value={commandPayload}
-                    onChange={(event) => setCommandPayload(event.target.value)}
-                    rows={10}
-                  />
-                </label>
-              </details>
-              <details className="detail-block">
-                <summary>Command receipt</summary>
-                <pre className="result-box">
-                  {commandResult || "Command result appears here after execution."}
-                </pre>
-              </details>
-            </section>
+            )}
+          </div>
+        </section>
 
-            <section className="panel">
+        <FocusedRecordSummary
+          application={application}
+          onCopyApplicationId={(nextApplicationId) => void handleCopyApplicationId(nextApplicationId)}
+        />
+
+        <div className="workspace-grid dashboard-grid">
+          <aside className="workspace-column left-column sticky-column">
+            <CommandCenterPanel
+              busy={busy}
+              applicationId={applicationId}
+              role={authUser.role}
+              toolDefinitions={toolDefinitions}
+              selectedTool={selectedTool}
+              onToolChange={handleToolChange}
+              onRunDemo={() => void handleRunDemo()}
+              onPrepareTool={prepareTool}
+              hasIntegrityCommand={hasIntegrityCommand}
+              onRunCommand={() => void handleRunCommand()}
+              selectedToolDefinition={selectedToolDefinition}
+              commandPayload={commandPayload}
+              onCommandPayloadChange={setCommandPayload}
+              commandResult={commandResult}
+            />
+
+            <section className="panel panel-support">
               <div className="panel-heading">
                 <div>
                   <p className="section-kicker">Role-Scoped Access</p>
-                  <h2>{isOperationsView ? "Role summary" : "Permissions summary"}</h2>
+                  <h2>Operator entitlements</h2>
                 </div>
               </div>
 
@@ -1477,9 +2895,13 @@ export default function App() {
                   <span>Auth audit visibility</span>
                   <strong>{canViewAudit ? "Granted" : "Restricted"}</strong>
                 </div>
+                <div>
+                  <span>Active tab</span>
+                  <strong>{titleize(workspaceMode)}</strong>
+                </div>
               </div>
               <details className="detail-block">
-                <summary>{isOperationsView ? "Role commands" : "Allowed commands"}</summary>
+                <summary>Allowed commands</summary>
                 <div className="tag-list">
                   {authUser.allowed_commands.map((command) => (
                     <span className="role-chip" key={command}>
@@ -1489,636 +2911,525 @@ export default function App() {
                 </div>
               </details>
             </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Integrity Verification</p>
-                  <h2>{isOperationsView ? "Verification status" : "Evidence posture"}</h2>
-                </div>
-                <div className="panel-actions">
-                  <StatusBadge label={integritySummary.status} tone={integritySummary.tone} />
-                  {isAuditView ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => toggleEvidencePanel("integrity")}
-                    >
-                      {evidencePanels.integrity ? "Hide evidence" : "Expand evidence"}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="definition-list">
-                <div>
-                  <span>Verification window</span>
-                  <strong>{integritySummary.verifiedWindow}</strong>
-                </div>
-                <div>
-                  <span>Latest verification</span>
-                  <strong>{integritySummary.verifiedAt}</strong>
-                </div>
-                <div>
-                  <span>Evidence hash</span>
-                  <strong>{integritySummary.evidenceHash}</strong>
-                </div>
-              </div>
-              {isAuditView && evidencePanels.integrity ? (
-                <div className="evidence-inline">
-                  <span className="meta-label">Tamper state</span>
-                  <p className="field-note">{integritySummary.tamperState}</p>
-                </div>
-              ) : null}
-            </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Temporal Replay</p>
-                  <h2>{isOperationsView ? "Reconstruction quick view" : "Regulatory reconstruction"}</h2>
-                </div>
-              </div>
-
-              <div className="temporal-toolbar">
-                <div className="temporal-inputs">
-                  <label>
-                    Application
-                    <input
-                      value={applicationId}
-                      onChange={(event) => setApplicationId(event.target.value)}
-                      placeholder="app-..."
-                    />
-                  </label>
-                  <label>
-                    As of
-                    <input
-                      type="datetime-local"
-                      value={temporalAsOf}
-                      onChange={(event) => setTemporalAsOf(event.target.value)}
-                    />
-                  </label>
-                </div>
-                <button
-                  className="button temporal-run"
-                  onClick={() => void handleTemporalInspect()}
-                  disabled={temporalBusy}
-                >
-                  {temporalBusy ? "Reconstructing..." : "Run reconstruction"}
-                </button>
-              </div>
-
-              <div className="checkpoint-list">
-                {applicationLineage.length === 0 ? (
-                  <p className="empty-state">No checkpoints available for this application.</p>
-                ) : (
-                  applicationLineage.slice(-replayCheckpointCount).map((item) => (
-                    <button
-                      className="checkpoint-button"
-                      key={item.key}
-                      onClick={() => setTemporalAsOf(toDateTimeLocalValue(item.recordedAt))}
-                    >
-                      <span className="checkpoint-event" title={titleize(item.eventType)}>
-                        {titleize(item.eventType)}
-                      </span>
-                      <span className="checkpoint-time">{prettyDateCompact(item.recordedAt)}</span>
-                    </button>
-                  ))
-                )}
-              </div>
-
-              <div className="temporal-summary">
-                <div className="comparison-grid">
-                  <div>
-                    <span>Current</span>
-                    <strong>
-                      {titleize(
-                        application?.compliance_status ??
-                          readString(currentComplianceSnapshot.compliance_status) ??
-                          "NOT_STARTED"
-                      )}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Historical</span>
-                    <strong>{titleize(readString(temporalSnapshot.compliance_status) ?? "Not loaded")}</strong>
-                  </div>
-                  <div>
-                    <span>Failed checks now</span>
-                    <strong>{currentFailedChecks}</strong>
-                  </div>
-                  <div>
-                    <span>Failed checks then</span>
-                    <strong>{temporalFailedChecks}</strong>
-                  </div>
-                </div>
-                <strong className="temporal-delta">{temporalDelta}</strong>
-                <div className="definition-list compact">
-                  <div>
-                    <span>As of</span>
-                    <strong>{temporalAsOf ? prettyDate(fromDateTimeLocalValue(temporalAsOf)) : "Not set"}</strong>
-                  </div>
-                  <div>
-                    <span>Application</span>
-                    <strong>{applicationId || "Not set"}</strong>
-                  </div>
-                </div>
-              </div>
-            </section>
           </aside>
 
           <main className="workspace-column center-column">
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Application Snapshot</p>
-                  <h2>Focused application</h2>
-                </div>
-                <div className="focus-controls">
-                  <label>
-                    Agent ID
-                    <input
-                      value={agentId}
-                      onChange={(event) => setAgentId(event.target.value)}
-                      placeholder="credit-agent-ethi-01"
-                    />
-                  </label>
-                  <button className="button subtle" onClick={() => void refreshFocused()} disabled={busy}>
-                    Refresh focus
-                  </button>
-                  {isAuditView ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => toggleEvidencePanel("snapshot")}
-                    >
-                      {evidencePanels.snapshot ? "Hide evidence" : "Expand evidence"}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              {!application ? (
-                <p className="empty-state">Select an application or run a governed lifecycle.</p>
-              ) : (
-                <div className="snapshot-grid">
-                  <div className="snapshot-main">
-                    <div className="snapshot-title-row">
-                      <div>
-                        <span className="meta-label">Application</span>
-                        <h3>{application.application_id}</h3>
-                      </div>
-                      <StatusBadge label={titleize(application.current_state)} tone={toTone(application.current_state)} />
-                    </div>
-
-                    <div className="definition-list compact">
-                      <div>
-                        <span>Requested (ETB)</span>
-                        <strong>{formatMoney(application.requested_amount_usd)}</strong>
-                      </div>
-                      <div>
-                        <span>Recommendation</span>
-                        <strong>{titleize(application.decision_recommendation ?? "Pending")}</strong>
-                      </div>
-                      <div>
-                        <span>Final decision</span>
-                        <strong>{titleize(application.final_decision ?? "Pending")}</strong>
-                      </div>
-                      <div>
-                        <span>Approved (ETB)</span>
-                        <strong>{formatMoney(application.approved_amount_usd)}</strong>
-                      </div>
-                      <div>
-                        <span>Max limit (ETB)</span>
-                        <strong>{formatMoney(application.assessed_max_limit_usd)}</strong>
-                      </div>
-                      <div>
-                        <span>Compliance posture</span>
-                        <strong>{titleize(application.compliance_status ?? "Not started")}</strong>
-                      </div>
-                    </div>
-                    {isAuditView && evidencePanels.snapshot ? (
-                      <div className="evidence-block">
-                        <span className="meta-label">Event evidence</span>
-                        <div className="definition-list compact">
-                          <div>
-                            <span>Last event</span>
-                            <strong>{titleize(application.last_event_type)}</strong>
-                          </div>
-                          <div>
-                            <span>Global position</span>
-                            <strong>#{application.last_global_position}</strong>
-                          </div>
-                          <div>
-                            <span>Updated</span>
-                            <strong>{prettyDate(application.updated_at)}</strong>
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div className="snapshot-side">
-                    <div className="side-card">
-                      <span className="meta-label">Compliance posture</span>
-                      <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Not available")}</strong>
-                      <p>Regulation set {readString(currentComplianceSnapshot.regulation_set_version) ?? "Not set"}</p>
-                    </div>
-                    <div className="side-card">
-                      <span className="meta-label">Integrity verification</span>
-                      <strong>{integritySummary.status}</strong>
-                      <p>{integritySummary.verifiedAt}</p>
-                    </div>
-                    <div className="side-card">
-                      <span className="meta-label">Last refresh</span>
-                      <strong>{prettyDate(application.updated_at)}</strong>
-                      <p>Projection status synced from immutable events.</p>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </section>
-
-            <section className="panel lineage-panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Decision Lineage</p>
-                  <h2>Event evidence timeline</h2>
-                </div>
-                <div className="panel-actions">
-                  <p className="section-note">
-                    {isOperationsView
-                      ? `${visibleLineage.length} of ${lineageTotalCount} events`
-                      : `${visibleLineage.length} events in view`}
-                  </p>
-                  {isAuditView ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => toggleEvidencePanel("lineage")}
-                    >
-                      {evidencePanels.lineage ? "Hide evidence" : "Expand evidence"}
-                    </button>
-                  ) : null}
-                  {isOperationsView && lineageTotalCount > lineageDefaultCount ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => setShowAllLineage((current) => !current)}
-                    >
-                      {showAllLineage ? "Show less" : "Show all"}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              {visibleLineage.length === 0 ? (
-                <p className="empty-state">No lineage for the current application focus.</p>
-              ) : (
-                <div className="lineage-list">
-                  {visibleLineage.map((item) => (
-                    <article className="lineage-item" key={item.key}>
-                      <div className={`lineage-node tone-${item.tone}`} aria-hidden="true" />
-                      <div className="lineage-content">
-                        <div className="lineage-header">
-                          <div>
-                            <span className="lineage-lane">{item.lane}</span>
-                            <h3>{titleize(item.eventType)}</h3>
-                          </div>
-                          <StatusBadge label={prettyDate(item.recordedAt)} tone={item.tone} />
-                        </div>
-                        <div className="lineage-meta">
-                          <span>{item.actor}</span>
-                          <span>
-                            {applicationId
-                              ? isOperationsView
-                                ? shortId(applicationId, 5)
-                                : applicationId
-                              : "No application selected"}
-                          </span>
-                          {isAuditView ? <span>{item.checkpoint}</span> : null}
-                        </div>
-                        <p className={`lineage-summary ${isOperationsView ? "compact" : ""}`}>
-                          {item.summary}
-                        </p>
-                        {isAuditView && evidencePanels.lineage ? (
-                          <div className="evidence-inline">
-                            <span className="meta-label">Event metadata</span>
-                            <div className="lineage-evidence">
-                              <span>Stream {item.streamId}</span>
-                              <span>Position #{item.globalPosition}</span>
-                              <span>Correlation {shortId(item.correlationId)}</span>
-                              <span>Causation {shortId(item.causationId)}</span>
-                            </div>
-                          </div>
-                        ) : null}
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Recent Activity</p>
-                  <h2>Latest ledger events</h2>
-                </div>
-                <div className="panel-actions">
-                  <p className="section-note">
-                    {isOperationsView
-                      ? `${visibleActivity.length} of ${activityTotalCount} events`
-                      : "Ordered by latest append."}
-                  </p>
-                  {isAuditView ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => toggleEvidencePanel("activity")}
-                    >
-                      {evidencePanels.activity ? "Hide evidence" : "Expand evidence"}
-                    </button>
-                  ) : null}
-                  {isOperationsView && activityTotalCount > activityDefaultCount ? (
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => setShowAllActivity((current) => !current)}
-                    >
-                      {showAllActivity ? "Show less" : "Show all"}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              {visibleActivity.length === 0 ? (
-                <p className="empty-state">No ledger events available for this scope.</p>
-              ) : (
-                <div className="activity-table">
-                  <div className="list-head">
-                    <span>Event</span>
-                    <span>Application</span>
-                    <span>Lane</span>
-                  </div>
-                  {visibleActivity.map((event) => {
-                    const payload = readRecord(event.payload);
-                    const metadata = readRecord(event.metadata);
-                    const rowApplicationId = readString(payload.application_id);
-                    return (
-                      <article className="event-row-wrap" key={event.event_id}>
-                        <button
-                          className="activity-row"
-                          onClick={() => {
-                            const nextApplicationId = readString(payload.application_id);
-                            if (nextApplicationId) {
-                              void handleSelectApplication(nextApplicationId);
-                            }
-                          }}
-                        >
-                          <div>
-                            <strong title={titleize(event.event_type)}>{titleize(event.event_type)}</strong>
-                            <span title={actorForEvent(event.event_type, payload, metadata)}>
-                              {actorForEvent(event.event_type, payload, metadata)}
-                            </span>
-                          </div>
-                          <div>
-                            <strong title={rowApplicationId ?? "Unlinked event"}>
-                              {!rowApplicationId
-                                ? "Unlinked event"
-                                : shortId(rowApplicationId, isAuditView ? 8 : 5)}
-                            </strong>
-                            <span title={prettyDate(event.recorded_at)}>{prettyDateCompact(event.recorded_at)}</span>
-                          </div>
-                          <div>
-                            <strong title={titleize(laneForEvent(event.event_type))}>
-                              {titleize(laneForEvent(event.event_type))}
-                            </strong>
-                            <span>{isAuditView ? `Pos #${event.global_position}` : "Open"}</span>
-                          </div>
-                        </button>
-                        {isAuditView && evidencePanels.activity ? (
-                          <div className="evidence-inline">
-                            <span className="meta-label">Event IDs</span>
-                            <div className="lineage-evidence">
-                              <span>Application {rowApplicationId ?? "Unlinked event"}</span>
-                              <span>Stream {event.stream_id}</span>
-                              <span>Event {shortId(event.event_id)}</span>
-                              <span>Global #{event.global_position}</span>
-                            </div>
-                          </div>
-                        ) : null}
-                      </article>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-          </main>
-
-          <aside className="workspace-column right-column">
-            <section className="panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="section-kicker">Application Register</p>
-                    <h2>Tracked pipeline</h2>
-                  </div>
-                <p className="section-note">{visibleApplicationRows.length} rows in view</p>
-              </div>
-
-              <div className="application-list">
-                <div className="list-head">
-                  <span>Application</span>
-                  <span>Pipeline</span>
-                  <span>Compliance</span>
-                </div>
-                {visibleApplicationRows.map((item) => (
-                  <button
-                    key={item.application_id}
-                    className={`application-row ${
-                      application?.application_id === item.application_id ? "active" : ""
-                    }`}
-                    onClick={() => void handleSelectApplication(item.application_id)}
-                  >
-                    <div>
-                      <strong title={item.application_id}>
-                        {shortId(item.application_id, isOperationsView ? 6 : 8)}
-                      </strong>
-                      <span>{isOperationsView ? "Commercial application" : "Operational record"}</span>
-                    </div>
-                    <div>
-                      <strong>{titleize(item.current_state)}</strong>
-                      <span>{prettyDate(item.updated_at)}</span>
-                    </div>
-                    <div className="row-end">
-                      <StatusBadge
-                        label={titleize(item.compliance_status ?? "Not started")}
-                        tone={toTone(item.compliance_status)}
-                      />
-                      <span className="row-muted">
-                        {application?.application_id === item.application_id ? "Focused" : "Select"}
-                      </span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Projection Status</p>
-                  <h2>Lag and catch-up</h2>
-                </div>
-              </div>
-
-              <div className="projection-list">
-                {projectionStatusRows.length === 0 ? (
-                  <p className="empty-state">Projection checkpoints have not reported yet.</p>
-                ) : (
-                  projectionStatusRows.map(({ name, lag, assessment }) => {
-                    const ratio = lag.latest_position > 0 ? lag.checkpoint_position / lag.latest_position : 1;
-                    return (
-                      <article className="projection-row" key={name}>
-                        <div className="projection-head">
-                          <strong>{titleize(name)}</strong>
-                          <StatusBadge label={assessment.label} tone={assessment.tone} />
-                        </div>
-                        <div className="projection-metrics">
-                          <span>{lag.events_behind > 0 ? `${lag.events_behind} events behind` : "No event backlog"}</span>
-                          <span>{formatLagMs(lag.lag_ms)} lag</span>
-                          <span>Pos #{lag.checkpoint_position}</span>
-                        </div>
-                        <p className="projection-note">{assessment.helper}</p>
-                        <div className="progress-track" aria-hidden="true">
-                          <span className="progress-fill" style={{ width: `${Math.max(6, ratio * 100)}%` }} />
-                        </div>
-                      </article>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Compliance Posture</p>
-                  <h2>{isOperationsView ? "Posture summary" : "Current regulatory state"}</h2>
-                </div>
-                {isAuditView ? (
-                  <div className="panel-actions">
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => toggleEvidencePanel("compliance")}
-                    >
-                      {evidencePanels.compliance ? "Hide evidence" : "Expand evidence"}
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-
-              {compliance ? (
-                <>
-                  <div className={`definition-list ${isOperationsView ? "" : "compact"}`}>
-                    <div>
-                      <span>Status</span>
-                      <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Unknown")}</strong>
-                    </div>
-                    <div>
-                      <span>Regulation set</span>
-                      <strong>{readString(currentComplianceSnapshot.regulation_set_version) ?? "Unavailable"}</strong>
-                    </div>
-                    {isAuditView ? (
-                      <div>
-                        <span>Mandatory checks</span>
-                        <strong>{readStringList(currentComplianceSnapshot.mandatory_checks).length}</strong>
-                      </div>
-                    ) : null}
-                    {isAuditView ? (
-                      <div>
-                        <span>Passed checks</span>
-                        <strong>{readStringList(currentComplianceSnapshot.passed_checks).length}</strong>
-                      </div>
-                    ) : null}
-                    <div>
-                      <span>Failed checks</span>
-                      <strong>{currentFailedChecks}</strong>
-                    </div>
-                    <div>
-                      <span>Projection updated</span>
-                      <strong>{prettyDate(readString(currentComplianceSnapshot.updated_at))}</strong>
-                    </div>
-                  </div>
-
-                  {isAuditView && evidencePanels.compliance ? (
-                    <div className="evidence-block">
-                      <span className="meta-label">Compliance event evidence</span>
-                      <div className="mini-timeline">
-                        {compliance.timeline.slice(-6).map((entry) => {
-                          const evidenceStatus = complianceEvidenceStatus(entry);
-                          return (
-                            <article className="mini-timeline-row" key={`${entry.global_position}-${entry.event_type}`}>
-                              <div>
-                                <strong>{titleize(entry.event_type)}</strong>
-                                <span>
-                                  {entry.rule_id
-                                    ? `${entry.rule_id} · ${entry.rule_version ?? "active"}`
-                                    : "Policy evaluation"}
-                                </span>
-                              </div>
-                              <div>
-                                <strong className={`tone-${evidenceStatus.tone}`}>{evidenceStatus.label}</strong>
-                                <span>{prettyDate(entry.recorded_at)}</span>
-                              </div>
-                            </article>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : null}
-                </>
-              ) : (
-                <p className="empty-state">No compliance view for the current application.</p>
-              )}
-            </section>
-
-            {isAuditView ? (
+            {isOperationsView ? (
               <>
                 <section className="panel">
                   <div className="panel-heading">
                     <div>
-                      <p className="section-kicker">Model Oversight</p>
-                      <h2>Agent performance</h2>
+                      <p className="section-kicker">Application Snapshot</p>
+                      <h2>Focused application</h2>
+                    </div>
+                    <div className="focus-controls">
+                      <label>
+                        Agent ID
+                        <input
+                          value={agentId}
+                          onChange={(event) => setAgentId(event.target.value)}
+                          placeholder="credit-agent-ethi-01"
+                        />
+                      </label>
+                      <button className="button subtle" onClick={() => void refreshFocused()} disabled={busy}>
+                        Refresh focus
+                      </button>
                     </div>
                   </div>
 
-                  {!agentPerformance || agentPerformance.models.length === 0 ? (
-                    <p className="empty-state">No model projection for the current agent.</p>
+                  {!application ? (
+                    <p className="empty-state">Select an application or run a governed lifecycle.</p>
                   ) : (
-                    <div className="activity-table compact">
-                      {agentPerformance.models.map((model) => (
-                        <div className="activity-row static" key={`${model.agent_id}-${model.model_version}`}>
+                    <div className="snapshot-grid">
+                      <div className="snapshot-main">
+                        <div className="snapshot-title-row">
                           <div>
-                            <strong>{model.model_version}</strong>
-                            <span>{model.agent_id}</span>
+                            <span className="meta-label">Application</span>
+                            <div className="record-id-row">
+                              <h3 title={application.application_id}>{shortId(application.application_id, 8)}</h3>
+                              <button
+                                type="button"
+                                className="button subtle copy-id-button"
+                                onClick={() => void handleCopyApplicationId(application.application_id)}
+                                title={application.application_id}
+                              >
+                                Copy ID
+                              </button>
+                            </div>
+                          </div>
+                          <StatusBadge label={titleize(application.current_state)} tone={toTone(application.current_state)} />
+                        </div>
+
+                        <div className="definition-list compact">
+                          <div>
+                            <span>Requested (ETB)</span>
+                            <strong>{formatMoney(application.requested_amount_usd)}</strong>
                           </div>
                           <div>
-                            <strong>{model.analyses_completed} analyses</strong>
-                            <span>{model.fraud_screenings_completed} fraud screenings</span>
+                            <span>Recommendation</span>
+                            <strong>{titleize(application.decision_recommendation ?? "Pending")}</strong>
                           </div>
                           <div>
-                            <strong>{model.avg_confidence_score.toFixed(2)}</strong>
-                            <span>{model.decisions_recorded} decisions</span>
+                            <span>Final decision</span>
+                            <strong>{titleize(application.final_decision ?? "Pending")}</strong>
+                          </div>
+                          <div>
+                            <span>Approved (ETB)</span>
+                            <strong>{formatMoney(application.approved_amount_usd)}</strong>
+                          </div>
+                          <div>
+                            <span>Max limit (ETB)</span>
+                            <strong>{formatMoney(application.assessed_max_limit_usd)}</strong>
+                          </div>
+                          <div>
+                            <span>Compliance posture</span>
+                            <strong>{titleize(application.compliance_status ?? "Not started")}</strong>
                           </div>
                         </div>
-                      ))}
+                      </div>
+
+                      <div className="snapshot-side">
+                        <div className="side-card">
+                          <span className="meta-label">Event evidence</span>
+                          <strong>{titleize(application.last_event_type)}</strong>
+                          <p>Global #{application.last_global_position}</p>
+                        </div>
+                        <div className="side-card">
+                          <span className="meta-label">Projection update</span>
+                          <strong>{prettyDate(application.updated_at)}</strong>
+                          <p>State derived from immutable events.</p>
+                        </div>
+                        <div className="side-card">
+                          <span className="meta-label">Compliance posture</span>
+                          <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Not available")}</strong>
+                          <p>Regulation set {readString(currentComplianceSnapshot.regulation_set_version) ?? "Not set"}</p>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </section>
 
                 <section className="panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Tracked Pipeline</p>
+                      <h2>Application register</h2>
+                    </div>
+                    <p className="section-note">{visibleApplicationRows.length} rows in view</p>
+                  </div>
+
+                  <div className="application-list">
+                    <div className="list-head">
+                      <span>Application</span>
+                      <span>Pipeline</span>
+                      <span>Compliance</span>
+                    </div>
+                    {visibleApplicationRows.map((item) => {
+                      const isFocused = application?.application_id === item.application_id;
+                      const isDimmed = Boolean(application?.application_id) && !isFocused;
+                      return (
+                        <button
+                          key={item.application_id}
+                          className={`application-row ${isFocused ? "active" : ""} ${isDimmed ? "dimmed" : ""}`}
+                          onClick={() => void handleSelectApplication(item.application_id)}
+                        >
+                          <div>
+                            <strong title={item.application_id}>{shortId(item.application_id, 8)}</strong>
+                            <span>Commercial application</span>
+                          </div>
+                          <div>
+                            <strong>{titleize(item.current_state)}</strong>
+                            <span>{prettyDate(item.updated_at)}</span>
+                          </div>
+                          <div className="row-end">
+                            <StatusBadge
+                              label={titleize(item.compliance_status ?? "Not started")}
+                              tone={toTone(item.compliance_status)}
+                            />
+                            <span className="row-muted">{isFocused ? "Focused" : "Select"}</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              </>
+            ) : null}
+
+            {isAuditView ? (
+              <>
+                <AuditPhaseTimeline
+                  timelineGroups={timelineGroups}
+                  collapsedTimelineGroups={collapsedTimelineGroups}
+                  onToggleGroup={(key, nextValue) =>
+                    setCollapsedTimelineGroups((current) => ({ ...current, [key]: nextValue }))
+                  }
+                  eventTypeFilter={eventTypeFilter}
+                  onEventTypeFilterChange={setEventTypeFilter}
+                  lineageEventTypes={lineageEventTypes}
+                  eventActorFilter={eventActorFilter}
+                  onEventActorFilterChange={setEventActorFilter}
+                  lineageActors={lineageActors}
+                  eventTimeRange={eventTimeRange}
+                  onEventTimeRangeChange={setEventTimeRange}
+                  onResetFilters={() => {
+                    setEventTypeFilter("all");
+                    setEventActorFilter("all");
+                    setEventTimeRange("all");
+                  }}
+                  filteredCount={filteredLineage.length}
+                  applicationId={applicationId}
+                  showMetadata={evidencePanels.lineage}
+                  onToggleMetadata={() => toggleEvidencePanel("lineage")}
+                />
+                <EventCoveragePanel
+                  applicationId={applicationId.trim()}
+                  observedEventTypes={lineageEventTypes}
+                />
+              </>
+            ) : null}
+
+            {isSystemView ? (
+              <>
+                <ProjectionHealthPanel rows={projectionStatusRows} />
+                <MCPResourcePanel
+                  resourceUri={resourceUri}
+                  onResourceUriChange={setResourceUri}
+                  onInspectResource={(target) => void handleInspectResource(target)}
+                  resourceBusy={resourceBusy}
+                  resourceQuickPicks={resourceQuickPicks}
+                  resourceHistory={resourceHistory}
+                  resourceDefinitions={resourceDefinitions}
+                  resourceResult={resourceResult}
+                />
+              </>
+            ) : null}
+          </main>
+
+          <aside className="workspace-column right-column">
+            {isOperationsView ? (
+              <>
+                <section className="panel panel-support">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Compliance Posture</p>
+                      <h2>Current status</h2>
+                    </div>
+                  </div>
+
+                  {compliance ? (
+                    <div className="definition-list compact">
+                      <div>
+                        <span>Status</span>
+                        <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Unknown")}</strong>
+                      </div>
+                      <div>
+                        <span>Regulation set</span>
+                        <strong>{readString(currentComplianceSnapshot.regulation_set_version) ?? "Unavailable"}</strong>
+                      </div>
+                      <div>
+                        <span>Failed checks</span>
+                        <strong>{currentFailedChecks}</strong>
+                      </div>
+                      <div>
+                        <span>Projection updated</span>
+                        <strong>{prettyDate(readString(currentComplianceSnapshot.updated_at))}</strong>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="empty-state">No compliance view for the current application.</p>
+                  )}
+                </section>
+
+                <IntegrityStatusCard
+                  title="Verification status"
+                  status={integritySummary.status}
+                  tone={integritySummary.tone}
+                  verified={integrityCoverage.verified}
+                  total={integrityCoverage.total || 0}
+                  evidenceHash={integritySummary.evidenceHash}
+                  verifiedAt={integritySummary.verifiedAt}
+                  verifiedWindow={integritySummary.verifiedWindow}
+                  tamperState={integritySummary.tamperState}
+                  hasIntegrityCommand={hasIntegrityCommand}
+                  busy={busy}
+                  onRunVerification={() => void handleRunVerification()}
+                />
+              </>
+            ) : null}
+
+            {isAuditView ? (
+              <>
+                <IntegrityStatusCard
+                  title="Audit evidence"
+                  status={integritySummary.status}
+                  tone={integritySummary.tone}
+                  verified={integrityCoverage.verified}
+                  total={integrityCoverage.total || 0}
+                  evidenceHash={integritySummary.evidenceHash}
+                  verifiedAt={integritySummary.verifiedAt}
+                  verifiedWindow={integritySummary.verifiedWindow}
+                  tamperState={integritySummary.tamperState}
+                  hasIntegrityCommand={hasIntegrityCommand}
+                  busy={busy}
+                  onRunVerification={() => void handleRunVerification()}
+                  showEvidenceToggle
+                  evidenceExpanded={evidencePanels.integrity}
+                  onToggleEvidence={() => toggleEvidencePanel("integrity")}
+                />
+
+                <section className="panel temporal-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Temporal Replay</p>
+                      <h2>Regulatory reconstruction</h2>
+                    </div>
+                  </div>
+
+                  <div className="temporal-toolbar">
+                    <div className="temporal-inputs">
+                      <label>
+                        Application
+                        <input
+                          value={applicationId}
+                          onChange={(event) => setApplicationId(event.target.value)}
+                          placeholder="app-..."
+                        />
+                      </label>
+                      <label>
+                        As of
+                        <input
+                          type="datetime-local"
+                          value={temporalAsOf}
+                          onChange={(event) => setTemporalAsOf(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                    <button
+                      className="button temporal-run"
+                      onClick={() => void handleTemporalInspect()}
+                      disabled={temporalBusy}
+                    >
+                      {temporalBusy ? "Reconstructing..." : "Run reconstruction"}
+                    </button>
+                  </div>
+
+                  <div className="checkpoint-list">
+                    {applicationLineage.length === 0 ? (
+                      <p className="empty-state">No checkpoints available for this application.</p>
+                    ) : (
+                      applicationLineage.slice(-replayCheckpointCount).map((item) => (
+                        <button
+                          className="checkpoint-button"
+                          key={item.key}
+                          onClick={() => setTemporalAsOf(toDateTimeLocalValue(item.recordedAt))}
+                        >
+                          <span className="checkpoint-event" title={titleize(item.eventType)}>
+                            {titleize(item.eventType)}
+                          </span>
+                          <span className="checkpoint-time">{prettyDateCompact(item.recordedAt)}</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="temporal-summary">
+                    <div className="comparison-grid">
+                      <div>
+                        <span>Current posture</span>
+                        <strong>
+                          {titleize(
+                            application?.compliance_status ??
+                              readString(currentComplianceSnapshot.compliance_status) ??
+                              "NOT_STARTED"
+                          )}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>Historical posture</span>
+                        <strong>{titleize(readString(temporalSnapshot.compliance_status) ?? "Not loaded")}</strong>
+                      </div>
+                      <div>
+                        <span>Failed checks now</span>
+                        <strong>{currentFailedChecks}</strong>
+                      </div>
+                      <div>
+                        <span>Failed checks then</span>
+                        <strong>{temporalFailedChecks}</strong>
+                      </div>
+                    </div>
+                    <strong className="temporal-delta">{temporalDelta}</strong>
+                    <div className="definition-list compact">
+                      <div>
+                        <span>As of</span>
+                        <strong>{temporalAsOf ? prettyDate(fromDateTimeLocalValue(temporalAsOf)) : "Not set"}</strong>
+                      </div>
+                      <div>
+                        <span>Application</span>
+                        <strong>{applicationId || "Not set"}</strong>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="panel panel-raw-activity">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Recent Activity</p>
+                      <h2>Latest append stream</h2>
+                    </div>
+                    <div className="panel-actions">
+                      <p className="section-note">Raw append order from the ledger.</p>
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => toggleEvidencePanel("activity")}
+                      >
+                        {evidencePanels.activity ? "Hide evidence" : "Show evidence"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {visibleActivity.length === 0 ? (
+                    <p className="empty-state">No ledger events available for this scope.</p>
+                  ) : (
+                    <div className="activity-table">
+                      <div className="list-head">
+                        <span>Event</span>
+                        <span>Application</span>
+                        <span>Lane</span>
+                      </div>
+                      {visibleActivity.map((event) => {
+                        const payload = readRecord(event.payload);
+                        const metadata = readRecord(event.metadata);
+                        const rowApplicationId = readString(payload.application_id);
+                        return (
+                          <article className="event-row-wrap" key={event.event_id}>
+                            <button
+                              className="activity-row"
+                              onClick={() => {
+                                const nextApplicationId = readString(payload.application_id);
+                                if (nextApplicationId) {
+                                  void handleSelectApplication(nextApplicationId);
+                                }
+                              }}
+                            >
+                              <div>
+                                <strong title={titleize(event.event_type)}>{titleize(event.event_type)}</strong>
+                                <span title={actorForEvent(event.event_type, payload, metadata)}>
+                                  {actorForEvent(event.event_type, payload, metadata)}
+                                </span>
+                              </div>
+                              <div>
+                                <strong title={rowApplicationId ?? "Unlinked event"}>
+                                  {!rowApplicationId ? "Unlinked event" : shortId(rowApplicationId, 8)}
+                                </strong>
+                                <span title={prettyDate(event.recorded_at)}>{prettyDateCompact(event.recorded_at)}</span>
+                              </div>
+                              <div>
+                                <strong title={titleize(laneForEvent(event.event_type))}>
+                                  {titleize(laneForEvent(event.event_type))}
+                                </strong>
+                                <span>Pos #{event.global_position}</span>
+                              </div>
+                            </button>
+                            {evidencePanels.activity ? (
+                              <div className="evidence-inline">
+                                <span className="meta-label">Event IDs</span>
+                                <div className="lineage-evidence">
+                                  <span>Application {rowApplicationId ?? "Unlinked event"}</span>
+                                  <span>Stream {event.stream_id}</span>
+                                  <span>Event {shortId(event.event_id)}</span>
+                                  <span>Global #{event.global_position}</span>
+                                </div>
+                              </div>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+
+                <section className="panel panel-support">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Compliance Posture</p>
+                      <h2>Current regulatory state</h2>
+                    </div>
+                    <div className="panel-actions">
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => toggleEvidencePanel("compliance")}
+                      >
+                        {evidencePanels.compliance ? "Hide evidence" : "Show evidence"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {compliance ? (
+                    <>
+                      <div className="definition-list compact">
+                        <div>
+                          <span>Status</span>
+                          <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Unknown")}</strong>
+                        </div>
+                        <div>
+                          <span>Regulation set</span>
+                          <strong>{readString(currentComplianceSnapshot.regulation_set_version) ?? "Unavailable"}</strong>
+                        </div>
+                        <div>
+                          <span>Mandatory checks</span>
+                          <strong>{readStringList(currentComplianceSnapshot.mandatory_checks).length}</strong>
+                        </div>
+                        <div>
+                          <span>Passed checks</span>
+                          <strong>{readStringList(currentComplianceSnapshot.passed_checks).length}</strong>
+                        </div>
+                        <div>
+                          <span>Failed checks</span>
+                          <strong>{currentFailedChecks}</strong>
+                        </div>
+                        <div>
+                          <span>Projection updated</span>
+                          <strong>{prettyDate(readString(currentComplianceSnapshot.updated_at))}</strong>
+                        </div>
+                      </div>
+
+                      {evidencePanels.compliance ? (
+                        <div className="evidence-block">
+                          <span className="meta-label">Compliance event evidence</span>
+                          <div className="mini-timeline">
+                            {compliance.timeline.slice(-6).map((entry) => {
+                              const evidenceStatus = complianceEvidenceStatus(entry);
+                              return (
+                                <article className="mini-timeline-row" key={`${entry.global_position}-${entry.event_type}`}>
+                                  <div>
+                                    <strong>{titleize(entry.event_type)}</strong>
+                                    <span>
+                                      {entry.rule_id
+                                        ? `${entry.rule_id} · ${entry.rule_version ?? "active"}`
+                                        : "Policy evaluation"}
+                                    </span>
+                                  </div>
+                                  <div>
+                                    <strong className={`tone-${evidenceStatus.tone}`}>{evidenceStatus.label}</strong>
+                                    <span>{prettyDate(entry.recorded_at)}</span>
+                                  </div>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p className="empty-state">No compliance view for the current application.</p>
+                  )}
+                </section>
+
+                <section className="panel panel-support">
                   <div className="panel-heading">
                     <div>
                       <p className="section-kicker">Audit Access</p>
@@ -2160,13 +3471,157 @@ export default function App() {
                 </section>
               </>
             ) : null}
+
+            {isSystemView ? (
+              <>
+                <section className="panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Agent Session Resource</p>
+                      <h2>Session replay</h2>
+                    </div>
+                    <p className="section-note">Replay a selected agent session from the ledger.</p>
+                  </div>
+
+                  <div className="definition-list compact">
+                    <div>
+                      <span>Agent</span>
+                      <strong>{agentId || "Not set"}</strong>
+                    </div>
+                    <div>
+                      <span>Discovered sessions</span>
+                      <strong>{sessionCandidates.length}</strong>
+                    </div>
+                  </div>
+
+                  <label>
+                    Session ID
+                    <input
+                      value={sessionIdInput}
+                      onChange={(event) => setSessionIdInput(event.target.value)}
+                      placeholder="session-..."
+                      list="session-candidate-list"
+                    />
+                    <datalist id="session-candidate-list">
+                      {sessionCandidates.map((candidate) => (
+                        <option key={candidate} value={candidate} />
+                      ))}
+                    </datalist>
+                  </label>
+
+                  <div className="quick-actions">
+                    <button className="button" onClick={() => void handleLoadSessionReplay()} disabled={sessionReplayBusy}>
+                      {sessionReplayBusy ? "Loading session..." : "Load session replay"}
+                    </button>
+                    {sessionCandidates.length > 0 ? (
+                      <button
+                        className="button subtle"
+                        onClick={() => setSessionIdInput(sessionCandidates[0])}
+                        type="button"
+                      >
+                        Use latest discovered session
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {!sessionReplay ? (
+                    <p className="empty-state">Choose a session to load replay evidence.</p>
+                  ) : (
+                    <>
+                      <div className="definition-list compact session-summary">
+                        <div>
+                          <span>Loaded session</span>
+                          <strong>{sessionIdInput || "Not set"}</strong>
+                        </div>
+                        <div>
+                          <span>Stream</span>
+                          <strong>{sessionReplay.stream_id}</strong>
+                        </div>
+                        <div>
+                          <span>Events</span>
+                          <strong>{sessionReplay.events.length}</strong>
+                        </div>
+                      </div>
+                      <div className="activity-table compact">
+                        <div className="list-head">
+                          <span>Event</span>
+                          <span>Position</span>
+                          <span>Recorded</span>
+                        </div>
+                        {[...sessionReplay.events]
+                          .slice(-8)
+                          .reverse()
+                          .map((event) => (
+                            <div className="activity-row static" key={event.event_id}>
+                              <div>
+                                <strong>{titleize(event.event_type)}</strong>
+                                <span>{actorForEvent(event.event_type, readRecord(event.payload), readRecord(event.metadata))}</span>
+                              </div>
+                              <div>
+                                <strong>#{event.stream_position}</strong>
+                                <span>Global #{event.global_position}</span>
+                              </div>
+                              <div>
+                                <strong>{prettyDate(event.recorded_at)}</strong>
+                                <span>{shortId(event.event_id)}</span>
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+                    </>
+                  )}
+                </section>
+
+                <section className="panel panel-support">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="section-kicker">Model Oversight</p>
+                      <h2>Agent performance</h2>
+                    </div>
+                  </div>
+
+                  {!agentPerformance || agentPerformance.models.length === 0 ? (
+                    <p className="empty-state">No model projection for the current agent.</p>
+                  ) : (
+                    <div className="activity-table compact">
+                      {agentPerformance.models.map((model) => (
+                        <div className="activity-row static" key={`${model.agent_id}-${model.model_version}`}>
+                          <div>
+                            <strong>{model.model_version}</strong>
+                            <span>{model.agent_id}</span>
+                          </div>
+                          <div>
+                            <strong>{model.analyses_completed} analyses</strong>
+                            <span>{model.fraud_screenings_completed} fraud screenings</span>
+                          </div>
+                          <div>
+                            <strong>{model.avg_confidence_score.toFixed(2)}</strong>
+                            <span>{model.decisions_recorded} decisions</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </>
+            ) : null}
           </aside>
         </div>
 
-        <footer className="notice-bar panel">
-          <span className="notice-label">System notice</span>
-          <strong>{notice || "The Ledger is synchronized and ready for review."}</strong>
-        </footer>
+        {noticeToastVisible ? (
+          <div className="notice-toast" role="status" aria-live="polite">
+            <span className="notice-label">System notice</span>
+            <strong>{notice || "The Ledger is synchronized and ready for review."}</strong>
+            <button
+              type="button"
+              className="toast-close"
+              aria-label="Dismiss system notice"
+              onClick={() => setNoticeToastVisible(false)}
+            >
+              Close
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

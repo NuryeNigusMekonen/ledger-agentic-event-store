@@ -93,6 +93,16 @@ export type AuditTrail = {
   events: RecentEvent[];
 };
 
+export type AgentSessionReplay = {
+  stream_id: string;
+  events: RecentEvent[];
+};
+
+export type ResourceDefinition = {
+  uri: string;
+  description: string;
+};
+
 export type ToolDefinition = {
   name: string;
   description: string;

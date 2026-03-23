@@ -507,7 +507,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             action=f"command:{tool_name}",
             success=False,
             request=request,
-            details={"error_type": error.get("error_type")},
+            details={
+                "error_type": error.get("error_type"),
+                "message": error.get("message"),
+                "suggested_action": error.get("suggested_action"),
+            },
         )
         status_code = _error_status_code(str(error.get("error_type", "InternalError")))
         return _json_response(status_code=status_code, content={"ok": False, "error": error})
@@ -759,6 +763,74 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             f"ledger://applications/{application_id}/audit-trail"
         )
         return _resource_response(result)
+
+    @app.get("/api/v1/applications/{application_id}/events")
+    async def get_application_events(
+        application_id: str,
+        limit: int = Query(default=1000, ge=1, le=5000),
+    ) -> dict[str, Any]:
+        loan_stream_id = f"loan-{application_id}"
+        compliance_stream_id = f"compliance-{application_id}"
+        audit_stream_id = f"audit-application-{application_id}"
+        async with app.state.store._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH scoped_streams AS (
+                  SELECT DISTINCT stream_id
+                  FROM events
+                  WHERE payload ->> 'application_id' = $1
+                )
+                SELECT
+                  event_id,
+                  stream_id,
+                  stream_position,
+                  global_position,
+                  event_type,
+                  event_version,
+                  payload,
+                  metadata,
+                  recorded_at
+                FROM events
+                WHERE
+                  payload ->> 'application_id' = $1
+                  OR (
+                    payload ->> 'entity_type' = 'application'
+                    AND payload ->> 'entity_id' = $1
+                  )
+                  OR stream_id IN (SELECT stream_id FROM scoped_streams)
+                  OR stream_id IN ($2, $3, $4)
+                ORDER BY global_position ASC
+                LIMIT $5
+                """,
+                application_id,
+                loan_stream_id,
+                compliance_stream_id,
+                audit_stream_id,
+                limit,
+            )
+
+        events = [
+            {
+                "event_id": str(row["event_id"]),
+                "stream_id": row["stream_id"],
+                "stream_position": int(row["stream_position"]),
+                "global_position": int(row["global_position"]),
+                "event_type": row["event_type"],
+                "event_version": int(row["event_version"]),
+                "payload": dict(row["payload"]),
+                "metadata": dict(row["metadata"]),
+                "recorded_at": row["recorded_at"].isoformat(),
+            }
+            for row in rows
+        ]
+        return {
+            "ok": True,
+            "result": {
+                "application_id": application_id,
+                "items": events,
+                "count": len(events),
+            },
+        }
 
     @app.get("/api/v1/agents/{agent_id}/performance")
     async def get_agent_performance(agent_id: str) -> JSONResponse:

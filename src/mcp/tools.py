@@ -428,11 +428,14 @@ class LedgerMCPTools:
         )
         await self._after_write()
         latest_event = result.events[-1]
+        compliance_status = latest_event.event_type
+        if latest_event.event_type == "ComplianceCheckCompleted":
+            compliance_status = str(latest_event.payload.get("overall_verdict", compliance_status))
         return {
             "ok": True,
             "result": {
                 "check_id": str(latest_event.event_id),
-                "compliance_status": latest_event.event_type,
+                "compliance_status": compliance_status,
             },
         }
 
@@ -476,10 +479,14 @@ class LedgerMCPTools:
             )
         )
         await self._after_write()
+        decision_event = next(
+            (event for event in result.events if event.event_type == "DecisionGenerated"),
+            result.events[-1],
+        )
         return {
             "ok": True,
             "result": {
-                "decision_id": str(result.events[-1].event_id),
+                "decision_id": str(decision_event.event_id),
                 "recommendation": params.recommendation.upper(),
             },
         }

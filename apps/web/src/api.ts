@@ -1,5 +1,6 @@
 import type {
   AgentPerformance,
+  AgentSessionReplay,
   AuditTrail,
   ApiEnvelope,
   AppStateCount,
@@ -7,6 +8,7 @@ import type {
   ComplianceView,
   LedgerHealth,
   RecentEvent,
+  ResourceDefinition,
   ToolDefinition
 } from "./types";
 
@@ -134,6 +136,11 @@ export async function fetchTools(): Promise<ToolDefinition[]> {
   return result.tools;
 }
 
+export async function fetchResources(): Promise<ResourceDefinition[]> {
+  const result = await apiRequest<{ resources: ResourceDefinition[] }>("/resources");
+  return result.resources;
+}
+
 export async function runCommand(
   toolName: string,
   argumentsPayload: Record<string, unknown>
@@ -177,8 +184,126 @@ export async function fetchApplicationAuditTrail(applicationId: string): Promise
   return await apiRequest<AuditTrail>(`/applications/${applicationId}/audit-trail`);
 }
 
+export async function fetchApplicationEvents(
+  applicationId: string,
+  limit = 1000
+): Promise<RecentEvent[]> {
+  try {
+    const result = await apiRequest<{ items: RecentEvent[] }>(
+      `/applications/${applicationId}/events?limit=${limit}`
+    );
+    return result.items;
+  } catch (error) {
+    if (!(error instanceof LedgerApiError) || error.status !== 404) {
+      throw error;
+    }
+
+    // Backward-compatible fallback for older API servers that do not expose
+    // /applications/{id}/events yet.
+    const recent = await fetchRecentEvents(Math.max(limit, 500));
+    const streamIds = new Set<string>([
+      `loan-${applicationId}`,
+      `compliance-${applicationId}`,
+      `audit-application-${applicationId}`
+    ]);
+
+    for (const event of recent) {
+      const payloadAppId = String(event.payload.application_id ?? "");
+      const payloadEntityType = String(event.payload.entity_type ?? "");
+      const payloadEntityId = String(event.payload.entity_id ?? "");
+      if (
+        payloadAppId === applicationId ||
+        event.stream_id.includes(applicationId) ||
+        (payloadEntityType === "application" && payloadEntityId === applicationId)
+      ) {
+        streamIds.add(event.stream_id);
+      }
+    }
+
+    const streamResults = await Promise.all(
+      Array.from(streamIds).map(async (streamId) => {
+        try {
+          const stream = await apiRequest<{ items: RecentEvent[] }>(
+            `/streams/${encodeURIComponent(streamId)}?from_position=1&limit=1000`
+          );
+          return stream.items;
+        } catch {
+          return [] as RecentEvent[];
+        }
+      })
+    );
+
+    const deduped = new Map<string, RecentEvent>();
+    for (const event of streamResults.flat()) {
+      deduped.set(event.event_id, event);
+    }
+    return Array.from(deduped.values()).sort(
+      (left, right) => left.global_position - right.global_position
+    );
+  }
+}
+
 export async function fetchAgentPerformance(agentId: string): Promise<AgentPerformance> {
   return await apiRequest<AgentPerformance>(`/agents/${agentId}/performance`);
+}
+
+export async function fetchAgentSession(
+  agentId: string,
+  sessionId: string
+): Promise<AgentSessionReplay> {
+  return await apiRequest<AgentSessionReplay>(`/agents/${agentId}/sessions/${sessionId}`);
+}
+
+export async function fetchResourceByUri(uri: string): Promise<unknown> {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    throw new LedgerApiError("Invalid resource URI format.", 422, "ValidationError", "use_ledger_uri");
+  }
+
+  if (parsed.protocol !== "ledger:") {
+    throw new LedgerApiError(
+      `Unsupported resource scheme '${parsed.protocol}'.`,
+      422,
+      "ValidationError",
+      "use_ledger_scheme"
+    );
+  }
+
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parsed.hostname === "applications") {
+    if (parts.length === 1) {
+      return await fetchApplication(parts[0]);
+    }
+    if (parts.length === 2 && parts[1] === "compliance") {
+      const asOf = parsed.searchParams.get("as_of") ?? undefined;
+      return await fetchCompliance(parts[0], asOf);
+    }
+    if (parts.length === 2 && parts[1] === "audit-trail") {
+      return await fetchApplicationAuditTrail(parts[0]);
+    }
+  }
+
+  if (parsed.hostname === "agents") {
+    if (parts.length === 2 && parts[1] === "performance") {
+      return await fetchAgentPerformance(parts[0]);
+    }
+    if (parts.length === 3 && parts[1] === "sessions") {
+      return await fetchAgentSession(parts[0], parts[2]);
+    }
+  }
+
+  if (parsed.hostname === "ledger" && parts.length === 1 && parts[0] === "health") {
+    return await fetchLedgerHealth();
+  }
+
+  throw new LedgerApiError(
+    `Unknown resource URI '${uri}'.`,
+    404,
+    "UnknownResource",
+    "use_list_resources"
+  );
 }
 
 export async function fetchRecentEvents(limit = 20): Promise<RecentEvent[]> {
