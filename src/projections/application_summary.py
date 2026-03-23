@@ -148,6 +148,21 @@ class ApplicationSummaryProjection:
             return {"compliance_status": "FAILED"}
         if event_type == "ComplianceRulePassed":
             return {"compliance_status": "PENDING"}
+        if event_type == "ComplianceCheckCompleted":
+            verdict = str(payload.get("overall_verdict", "")).upper()
+            return {"compliance_status": verdict or "PENDING"}
+        if event_type in {
+            "DocumentUploadRequested",
+            "DocumentUploaded",
+            "FraudScreeningRequested",
+            "CreditAnalysisCompleted",
+            "FraudScreeningCompleted",
+            "DecisionRequested",
+            "HumanReviewRequested",
+        }:
+            # Touch the row so last-event metadata tracks
+            # the most recent application evidence.
+            return {}
         return None
 
 
@@ -157,4 +172,3 @@ def _merge_state(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, An
     if "current_state" not in merged:
         merged["current_state"] = "SUBMITTED"
     return merged
-

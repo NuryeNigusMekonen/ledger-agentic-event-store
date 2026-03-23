@@ -54,6 +54,7 @@ class ComplianceAuditViewProjection:
             "ComplianceCheckRequested",
             "ComplianceRulePassed",
             "ComplianceRuleFailed",
+            "ComplianceCheckCompleted",
         }:
             return
 
@@ -239,6 +240,16 @@ def _next_state(state: dict[str, Any], event: StoredEvent) -> dict[str, Any]:
         if rule_id:
             failed_checks[rule_id] = str(payload.get("failure_reason", ""))
             passed_checks.discard(rule_id)
+    elif event_type == "ComplianceCheckCompleted":
+        verdict = str(payload.get("overall_verdict", "")).upper()
+        if verdict in {"CLEARED", "FAILED", "PENDING", "NOT_STARTED"}:
+            return {
+                "regulation_set_version": regulation_set_version,
+                "mandatory_checks": mandatory_checks,
+                "passed_checks": passed_checks,
+                "failed_checks": failed_checks,
+                "compliance_status": verdict,
+            }
 
     compliance_status = _compute_compliance_status(
         mandatory_checks=mandatory_checks,

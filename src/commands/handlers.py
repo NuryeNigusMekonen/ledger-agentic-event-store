@@ -12,21 +12,29 @@ from src.aggregates.loan_application import LoanApplicationAggregate, LoanStatus
 from src.event_store import EventStore
 from src.models.events import (
     AgentContextLoadedEvent,
+    AgentSessionRecoveredEvent,
+    AgentSessionStartedEvent,
+    AppendResult,
     ApplicationApprovedEvent,
     ApplicationDeclinedEvent,
     ApplicationSubmittedEvent,
-    AppendResult,
     AuditIntegrityCheckRunEvent,
     BaseEvent,
+    ComplianceCheckCompletedEvent,
     ComplianceCheckRequestedEvent,
     ComplianceRuleFailedEvent,
     ComplianceRulePassedEvent,
     CreditAnalysisCompletedEvent,
     CreditAnalysisRequestedEvent,
     DecisionGeneratedEvent,
+    DecisionRequestedEvent,
+    DocumentUploadedEvent,
+    DocumentUploadRequestedEvent,
     DomainError,
     FraudScreeningCompletedEvent,
+    FraudScreeningRequestedEvent,
     HumanReviewCompletedEvent,
+    HumanReviewRequestedEvent,
     StoredEvent,
 )
 from src.refinery.pipeline import extract_financial_facts
@@ -169,6 +177,7 @@ class WriteCommandHandlers:
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
+        requested_at = datetime.now(UTC).isoformat()
         decided_events: list[BaseEvent] = [
             ApplicationSubmittedEvent(
                 payload={
@@ -186,21 +195,67 @@ class WriteCommandHandlers:
                 ),
             )
         ]
-        if not command.process_documents_after_submit:
-            decided_events.append(
-                CreditAnalysisRequestedEvent(
-                    payload={
-                        "application_id": command.application_id,
-                        "assigned_agent_id": "credit-analysis-router",
-                        "requested_at": datetime.now(UTC).isoformat(),
-                        "priority": "normal",
-                    },
-                    metadata=_metadata(
-                        correlation_id,
-                        causation_id=causation_id,
-                        actor_id=command.applicant_id,
+        if command.document_path:
+            decided_events.extend(
+                [
+                    DocumentUploadRequestedEvent(
+                        payload={
+                            "application_id": command.application_id,
+                            "requested_at": requested_at,
+                            "requested_by": command.applicant_id,
+                            "document_path": command.document_path,
+                        },
+                        metadata=_metadata(
+                            correlation_id,
+                            causation_id=causation_id,
+                            actor_id=command.applicant_id,
+                        ),
                     ),
-                )
+                    DocumentUploadedEvent(
+                        payload={
+                            "application_id": command.application_id,
+                            "uploaded_at": requested_at,
+                            "uploaded_by": command.applicant_id,
+                            "document_path": command.document_path,
+                        },
+                        metadata=_metadata(
+                            correlation_id,
+                            causation_id=causation_id,
+                            actor_id=command.applicant_id,
+                        ),
+                    ),
+                ]
+            )
+        if not command.process_documents_after_submit:
+            decided_events.extend(
+                [
+                    CreditAnalysisRequestedEvent(
+                        payload={
+                            "application_id": command.application_id,
+                            "assigned_agent_id": "credit-analysis-router",
+                            "requested_at": requested_at,
+                            "priority": "normal",
+                        },
+                        metadata=_metadata(
+                            correlation_id,
+                            causation_id=causation_id,
+                            actor_id=command.applicant_id,
+                        ),
+                    ),
+                    FraudScreeningRequestedEvent(
+                        payload={
+                            "application_id": command.application_id,
+                            "assigned_agent_id": "fraud-screening-router",
+                            "requested_at": requested_at,
+                            "priority": "normal",
+                        },
+                        metadata=_metadata(
+                            correlation_id,
+                            causation_id=causation_id,
+                            actor_id=command.applicant_id,
+                        ),
+                    ),
+                ]
             )
 
         # 4) Append
@@ -243,7 +298,22 @@ class WriteCommandHandlers:
                         causation_id=package_causation,
                         actor_id="document-processing-agent",
                     ),
-                )
+                ),
+                FraudScreeningRequestedEvent(
+                    payload={
+                        "application_id": command.application_id,
+                        "assigned_agent_id": "fraud-screening-router",
+                        "requested_at": datetime.now(UTC).isoformat(),
+                        "priority": "normal",
+                        "source": "document_package_ready",
+                        "docpkg_stream_id": _docpkg_stream_id(command.application_id),
+                    },
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=package_causation,
+                        actor_id="document-processing-agent",
+                    ),
+                ),
             ],
             expected_version=submit_result.new_stream_version,
             correlation_id=correlation_id,
@@ -410,7 +480,47 @@ class WriteCommandHandlers:
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
-        decided_events = [
+        now = datetime.now(UTC).isoformat()
+        decided_events: list[BaseEvent] = [
+            AgentSessionStartedEvent(
+                payload={
+                    "agent_id": command.agent_id,
+                    "session_id": command.session_id,
+                    "model_version": command.model_version,
+                    "context_source": command.context_source,
+                    "context_token_count": command.context_token_count,
+                    "started_at": now,
+                },
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.agent_id,
+                ),
+            )
+        ]
+
+        replay_prefix = "prior_session_replay:"
+        if command.context_source.startswith(replay_prefix):
+            recovered_from = command.context_source.removeprefix(replay_prefix).strip()
+            if recovered_from:
+                decided_events.append(
+                    AgentSessionRecoveredEvent(
+                        payload={
+                            "agent_id": command.agent_id,
+                            "session_id": command.session_id,
+                            "recovered_from_session_id": recovered_from,
+                            "context_source": command.context_source,
+                            "recovered_at": now,
+                        },
+                        metadata=_metadata(
+                            correlation_id,
+                            causation_id=causation_id,
+                            actor_id=command.agent_id,
+                        ),
+                    )
+                )
+
+        decided_events.append(
             AgentContextLoadedEvent(
                 payload={
                     "agent_id": command.agent_id,
@@ -426,7 +536,7 @@ class WriteCommandHandlers:
                     actor_id=command.agent_id,
                 ),
             )
-        ]
+        )
 
         # 4) Append
         return await self.store.append(
@@ -620,6 +730,49 @@ class WriteCommandHandlers:
                 )
             )
 
+        if compliance.status == "NOT_STARTED":
+            projected_mandatory = set(command.checks_required)
+        else:
+            projected_mandatory = set(compliance.mandatory_checks)
+        projected_passed = set(compliance.passed_checks)
+        projected_failed = dict(compliance.failed_checks)
+
+        if command.passed:
+            projected_passed.add(command.rule_id)
+        else:
+            projected_failed[command.rule_id] = command.failure_reason or ""
+            projected_passed.discard(command.rule_id)
+
+        if projected_failed:
+            projected_status = "FAILED"
+        elif projected_mandatory and projected_mandatory <= projected_passed:
+            projected_status = "CLEARED"
+        else:
+            projected_status = "PENDING"
+
+        is_terminal_transition = (
+            compliance.status in {"NOT_STARTED", "PENDING"}
+            and projected_status in {"CLEARED", "FAILED"}
+        )
+        if is_terminal_transition:
+            decided_events.append(
+                ComplianceCheckCompletedEvent(
+                    payload={
+                        "application_id": command.application_id,
+                        "overall_verdict": projected_status,
+                        "completed_checks": len(projected_passed) + len(projected_failed),
+                        "total_checks": len(projected_mandatory),
+                        "failed_rule_ids": sorted(projected_failed),
+                        "completed_at": datetime.now(UTC).isoformat(),
+                    },
+                    metadata=_metadata(
+                        correlation_id,
+                        causation_id=causation_id,
+                        actor_id="compliance-engine",
+                    ),
+                )
+            )
+
         # 4) Append
         return await self.store.append(
             stream_id=stream_id,
@@ -667,7 +820,25 @@ class WriteCommandHandlers:
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
         causation_id = command.causation_id
-        decided_events = [
+        request_time = datetime.now(UTC).isoformat()
+        decided_events: list[BaseEvent] = [
+            DecisionRequestedEvent(
+                payload={
+                    "application_id": command.application_id,
+                    "requested_at": request_time,
+                    "requested_by": command.orchestrator_agent_id,
+                    "required_inputs": [
+                        "credit_analysis",
+                        "fraud_screening",
+                        "compliance_verdict",
+                    ],
+                },
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.orchestrator_agent_id,
+                ),
+            ),
             DecisionGeneratedEvent(
                 payload={
                     "application_id": command.application_id,
@@ -685,7 +856,20 @@ class WriteCommandHandlers:
                     causation_id=causation_id,
                     actor_id=command.orchestrator_agent_id,
                 ),
-            )
+            ),
+            HumanReviewRequestedEvent(
+                payload={
+                    "application_id": command.application_id,
+                    "requested_at": request_time,
+                    "requested_by": command.orchestrator_agent_id,
+                    "recommendation": recommendation,
+                },
+                metadata=_metadata(
+                    correlation_id,
+                    causation_id=causation_id,
+                    actor_id=command.orchestrator_agent_id,
+                ),
+            ),
         ]
 
         # 4) Append

@@ -98,3 +98,96 @@ async def test_integrity_chain_detects_tampering(store: EventStore) -> None:
     assert tampered.chain_valid is False
     assert len(tampered.violations) >= 1
     assert tampered.violations[0].stream_position == 2
+
+
+@pytest.mark.asyncio
+async def test_store_append_auto_attaches_integrity_metadata(store: EventStore) -> None:
+    stream_id = f"loan-{uuid4()}"
+    await store.append(
+        stream_id=stream_id,
+        aggregate_type="LoanApplication",
+        expected_version=0,
+        events=[
+            ApplicationSubmittedEvent(
+                payload={"application_id": "app-2", "requested_amount_usd": 2500},
+            ),
+            DecisionGeneratedEvent(
+                payload={
+                    "application_id": "app-2",
+                    "recommendation": "REFER",
+                    "model_versions": {"orchestrator-1": "v2"},
+                    "contributing_agent_sessions": [],
+                    "decision_basis_summary": "requires manual adjudication",
+                },
+            ),
+        ],
+    )
+
+    result = await run_integrity_check(store, stream_id)
+    assert result.chain_valid is True
+    assert result.events_verified_count == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_integrity_hashes_repairs_legacy_missing_metadata(store: EventStore) -> None:
+    stream_id = f"loan-{uuid4()}"
+    await store.append(
+        stream_id=stream_id,
+        aggregate_type="LoanApplication",
+        expected_version=0,
+        events=[
+            ApplicationSubmittedEvent(
+                payload={"application_id": "app-3", "requested_amount_usd": 1500},
+            ),
+            DecisionGeneratedEvent(
+                payload={
+                    "application_id": "app-3",
+                    "recommendation": "APPROVE",
+                    "model_versions": {"orchestrator-1": "v2"},
+                    "contributing_agent_sessions": [],
+                    "decision_basis_summary": "eligible with conditions",
+                },
+            ),
+        ],
+    )
+
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE events
+            SET metadata = metadata - 'previous_hash' - 'integrity_hash'
+            WHERE stream_id = $1
+            """,
+            stream_id,
+        )
+        await conn.execute(
+            """
+            UPDATE event_streams
+            SET metadata = metadata - 'last_integrity_hash'
+            WHERE stream_id = $1
+            """,
+            stream_id,
+        )
+
+    invalid_before = await run_integrity_check(store, stream_id)
+    assert invalid_before.chain_valid is False
+
+    preview = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=True)
+    assert preview.events_repaired == 2
+    assert preview.streams_metadata_repaired == 1
+    assert preview.unresolved_violations == 0
+
+    still_invalid = await run_integrity_check(store, stream_id)
+    assert still_invalid.chain_valid is False
+
+    applied = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=False)
+    assert applied.events_repaired == 2
+    assert applied.streams_metadata_repaired == 1
+    assert applied.unresolved_violations == 0
+
+    valid_after = await run_integrity_check(store, stream_id)
+    assert valid_after.chain_valid is True
+
+    idempotent = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=False)
+    assert idempotent.events_repaired == 0
+    assert idempotent.streams_metadata_repaired == 0

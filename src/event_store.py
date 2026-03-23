@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import asyncpg
 from pydantic import BaseModel
@@ -20,6 +23,22 @@ from src.models.events import (
 )
 from src.upcasting.registry import UpcasterRegistry
 from src.upcasting.upcasters import create_default_upcaster_registry
+
+GENESIS_HASH = "GENESIS"
+
+
+@dataclass(slots=True)
+class IntegrityBackfillResult:
+    dry_run: bool
+    mode: str
+    streams_scanned: int
+    streams_with_events: int
+    streams_with_repairs: int
+    events_scanned: int
+    events_repaired: int
+    streams_metadata_repaired: int
+    violations_detected: int
+    unresolved_violations: int
 
 
 class EventStore:
@@ -144,6 +163,30 @@ class EventStore:
                         )
 
                 inserted_events: list[StoredEvent] = []
+                previous_integrity_hash = GENESIS_HASH
+                if current_version > 0:
+                    if isinstance(stream_row, asyncpg.Record):
+                        stream_metadata_row = dict(stream_row["metadata"] or {})
+                    else:
+                        stream_metadata_row = {}
+                    previous_integrity_hash = stream_metadata_row.get("last_integrity_hash") or ""
+                    if not previous_integrity_hash:
+                        existing_rows = await conn.fetch(
+                            """
+                            SELECT
+                              stream_id,
+                              stream_position,
+                              event_type,
+                              event_version,
+                              payload,
+                              metadata
+                            FROM events
+                            WHERE stream_id = $1
+                            ORDER BY stream_position ASC
+                            """,
+                            stream_id,
+                        )
+                        previous_integrity_hash = _compute_stream_tail_hash(existing_rows)
                 for offset, event in enumerate(events, start=1):
                     stream_position = current_version + offset
                     event_metadata = _event_metadata_with_lineage(
@@ -151,6 +194,18 @@ class EventStore:
                         correlation_id=correlation_id,
                         causation_id=causation_id,
                     )
+                    payload_object = _json_object(event.payload)
+                    event_integrity_hash = _compute_integrity_hash(
+                        stream_id=stream_id,
+                        stream_position=stream_position,
+                        event_type=event.event_type,
+                        event_version=event.event_version,
+                        payload=payload_object,
+                        metadata=event_metadata,
+                        previous_hash=previous_integrity_hash,
+                    )
+                    event_metadata["previous_hash"] = previous_integrity_hash
+                    event_metadata["integrity_hash"] = event_integrity_hash
                     row = await conn.fetchrow(
                         """
                         INSERT INTO events (
@@ -177,11 +232,12 @@ class EventStore:
                         stream_position,
                         event.event_type,
                         event.event_version,
-                        _json_object(event.payload),
+                        payload_object,
                         event_metadata,
                     )
                     inserted = _row_to_stored_event(row)
                     inserted_events.append(inserted)
+                    previous_integrity_hash = event_integrity_hash
 
                     await conn.execute(
                         """
@@ -207,6 +263,8 @@ class EventStore:
                     )
 
                 new_stream_version = current_version + len(events)
+                stream_metadata_patch = dict(metadata_patch)
+                stream_metadata_patch["last_integrity_hash"] = previous_integrity_hash
                 await conn.execute(
                     """
                     UPDATE event_streams
@@ -217,7 +275,7 @@ class EventStore:
                     """,
                     stream_id,
                     new_stream_version,
-                    metadata_patch,
+                    stream_metadata_patch,
                 )
 
                 return AppendResult(
@@ -460,6 +518,172 @@ class EventStore:
             raise StreamNotFoundError(stream_id)
         return _row_to_stream_metadata(row)
 
+    async def backfill_integrity_hashes(
+        self,
+        *,
+        stream_id: str | None = None,
+        stream_prefix: str | None = None,
+        mode: str = "missing",
+        dry_run: bool = True,
+    ) -> IntegrityBackfillResult:
+        if stream_id and stream_prefix:
+            raise DomainError("Provide either stream_id or stream_prefix, not both.")
+        if mode not in {"missing", "missing_or_invalid"}:
+            raise DomainError("mode must be one of: missing, missing_or_invalid.")
+
+        summary = IntegrityBackfillResult(
+            dry_run=dry_run,
+            mode=mode,
+            streams_scanned=0,
+            streams_with_events=0,
+            streams_with_repairs=0,
+            events_scanned=0,
+            events_repaired=0,
+            streams_metadata_repaired=0,
+            violations_detected=0,
+            unresolved_violations=0,
+        )
+
+        stream_ids: list[str]
+        if stream_id:
+            stream_ids = [stream_id]
+        else:
+            pattern = f"{stream_prefix}%" if stream_prefix else None
+            rows = await self._pool.fetch(
+                """
+                SELECT stream_id
+                FROM event_streams
+                WHERE ($1::text IS NULL OR stream_id LIKE $1)
+                ORDER BY stream_id ASC
+                """,
+                pattern,
+            )
+            stream_ids = [str(row["stream_id"]) for row in rows]
+
+        if not stream_ids:
+            if stream_id:
+                raise StreamNotFoundError(stream_id)
+            return summary
+
+        async with self._pool.acquire() as conn:
+            for current_stream_id in stream_ids:
+                summary.streams_scanned += 1
+                async with conn.transaction():
+                    stream_row = await conn.fetchrow(
+                        """
+                        SELECT stream_id, metadata
+                        FROM event_streams
+                        WHERE stream_id = $1
+                        FOR UPDATE
+                        """,
+                        current_stream_id,
+                    )
+                    if stream_row is None:
+                        if stream_id:
+                            raise StreamNotFoundError(current_stream_id)
+                        continue
+
+                    event_rows = await conn.fetch(
+                        """
+                        SELECT
+                          event_id,
+                          stream_id,
+                          stream_position,
+                          event_type,
+                          event_version,
+                          payload,
+                          metadata
+                        FROM events
+                        WHERE stream_id = $1
+                        ORDER BY stream_position ASC
+                        """,
+                        current_stream_id,
+                    )
+                    if not event_rows:
+                        continue
+
+                    summary.streams_with_events += 1
+                    previous_hash = GENESIS_HASH
+                    repaired_in_stream = 0
+                    stream_violations = 0
+                    stream_unresolved = 0
+
+                    for row in event_rows:
+                        metadata = dict(row["metadata"] or {})
+                        expected_hash = _compute_integrity_hash(
+                            stream_id=row["stream_id"],
+                            stream_position=int(row["stream_position"]),
+                            event_type=row["event_type"],
+                            event_version=int(row["event_version"]),
+                            payload=dict(row["payload"]),
+                            metadata=metadata,
+                            previous_hash=previous_hash,
+                        )
+                        actual_previous_hash = metadata.get("previous_hash")
+                        actual_integrity_hash = metadata.get("integrity_hash")
+                        valid = (
+                            actual_previous_hash == previous_hash
+                            and actual_integrity_hash == expected_hash
+                        )
+
+                        should_repair = False
+                        if mode == "missing":
+                            should_repair = (
+                                actual_previous_hash is None or actual_integrity_hash is None
+                            )
+                        elif not valid:
+                            should_repair = True
+
+                        if not valid:
+                            stream_violations += 1
+                            if not should_repair:
+                                stream_unresolved += 1
+
+                        if should_repair:
+                            repaired_metadata = dict(metadata)
+                            repaired_metadata["previous_hash"] = previous_hash
+                            repaired_metadata["integrity_hash"] = expected_hash
+                            if not dry_run:
+                                await conn.execute(
+                                    """
+                                    UPDATE events
+                                    SET metadata = $2::jsonb
+                                    WHERE event_id = $1
+                                    """,
+                                    row["event_id"],
+                                    repaired_metadata,
+                                )
+                            repaired_in_stream += 1
+
+                        summary.events_scanned += 1
+                        previous_hash = expected_hash
+
+                    stream_metadata = dict(stream_row["metadata"] or {})
+                    stream_meta_needs_repair = (
+                        stream_metadata.get("last_integrity_hash") != previous_hash
+                    )
+                    if stream_meta_needs_repair:
+                        if not dry_run:
+                            await conn.execute(
+                                """
+                                UPDATE event_streams
+                                SET metadata = metadata || $2::jsonb
+                                WHERE stream_id = $1
+                                """,
+                                current_stream_id,
+                                {"last_integrity_hash": previous_hash},
+                            )
+                        summary.streams_metadata_repaired += 1
+
+                    if repaired_in_stream > 0:
+                        summary.streams_with_repairs += 1
+                        summary.events_repaired += repaired_in_stream
+
+                    summary.violations_detected += stream_violations
+                    summary.unresolved_violations += stream_unresolved
+
+        return summary
+
 
 def _row_to_stored_event(
     row: asyncpg.Record,
@@ -519,5 +743,49 @@ def _event_metadata_with_lineage(
 
 def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, BaseModel):
-        return value.model_dump()
+        # Preserve sparse write payloads (don't materialize optional None defaults).
+        return value.model_dump(exclude_none=True)
     return dict(value)
+
+
+def _compute_integrity_hash(
+    *,
+    stream_id: str,
+    stream_position: int,
+    event_type: str,
+    event_version: int,
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    previous_hash: str,
+) -> str:
+    clean_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key not in {"integrity_hash", "previous_hash"}
+    }
+    canonical = {
+        "stream_id": stream_id,
+        "stream_position": stream_position,
+        "event_type": event_type,
+        "event_version": event_version,
+        "payload": payload,
+        "metadata": clean_metadata,
+        "previous_hash": previous_hash,
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compute_stream_tail_hash(rows: list[asyncpg.Record]) -> str:
+    previous_hash = GENESIS_HASH
+    for row in rows:
+        previous_hash = _compute_integrity_hash(
+            stream_id=row["stream_id"],
+            stream_position=int(row["stream_position"]),
+            event_type=row["event_type"],
+            event_version=int(row["event_version"]),
+            payload=dict(row["payload"]),
+            metadata=dict(row["metadata"]),
+            previous_hash=previous_hash,
+        )
+    return previous_hash

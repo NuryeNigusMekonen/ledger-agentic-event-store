@@ -26,10 +26,17 @@ def upcast_credit_analysis_completed_v1_to_v2(
     payload: dict[str, Any],
     metadata: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    inferred_model = metadata.get("model_version")
-    inference_method = "metadata:model_version" if inferred_model else "fallback:legacy_unknown"
-    if not inferred_model:
+    payload_model = payload.get("model_version")
+    metadata_model = metadata.get("model_version")
+    if payload_model:
+        inferred_model = payload_model
+        inference_method = "payload:model_version"
+    elif metadata_model:
+        inferred_model = metadata_model
+        inference_method = "metadata:model_version"
+    else:
         inferred_model = "legacy-unknown"
+        inference_method = "fallback:legacy_unknown"
 
     upcasted = {
         "application_id": payload.get("application_id"),
@@ -80,4 +87,3 @@ def upcast_decision_generated_v1_to_v2(
         "model_versions_inference": "orchestrator_model_version_metadata_or_legacy_unknown",
     }
     return upcasted, merged_metadata
-

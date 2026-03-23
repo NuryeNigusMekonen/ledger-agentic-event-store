@@ -60,7 +60,36 @@ class ApplicationSubmittedPayload(BaseModel):
     submitted_at: str | None = None
 
 
+class DocumentUploadRequestedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    requested_at: str
+    requested_by: str | None = None
+    document_path: str | None = None
+
+
+class DocumentUploadedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    uploaded_at: str
+    uploaded_by: str | None = None
+    document_path: str | None = None
+
+
 class CreditAnalysisRequestedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    assigned_agent_id: str | None = None
+    requested_at: str | None = None
+    priority: str | None = None
+    source: str | None = None
+    docpkg_stream_id: str | None = None
+
+
+class FraudScreeningRequestedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     application_id: str
@@ -80,6 +109,27 @@ class AgentContextLoadedPayload(BaseModel):
     context_source: str | None = None
     event_replay_from_position: int | None = Field(default=None, ge=0)
     context_token_count: int | None = Field(default=None, gt=0)
+
+
+class AgentSessionStartedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    session_id: str
+    model_version: str
+    context_source: str
+    context_token_count: int = Field(gt=0)
+    started_at: str | None = None
+
+
+class AgentSessionRecoveredPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    session_id: str
+    recovered_from_session_id: str
+    context_source: str
+    recovered_at: str | None = None
 
 
 class CreditAnalysisCompletedPayload(BaseModel):
@@ -136,6 +186,26 @@ class ComplianceRuleFailedPayload(BaseModel):
     remediation_required: bool = False
 
 
+class ComplianceCheckCompletedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    overall_verdict: str
+    completed_checks: int = Field(ge=0)
+    total_checks: int = Field(ge=0)
+    failed_rule_ids: list[str] = Field(default_factory=list)
+    completed_at: str | None = None
+
+
+class DecisionRequestedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    requested_at: str
+    requested_by: str | None = None
+    required_inputs: list[str] = Field(default_factory=list)
+
+
 class DecisionGeneratedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -148,6 +218,15 @@ class DecisionGeneratedPayload(BaseModel):
     model_versions: dict[str, str] = Field(default_factory=dict)
     compliance_status: str | None = None
     assessed_max_limit_usd: float | None = None
+
+
+class HumanReviewRequestedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    requested_at: str
+    requested_by: str | None = None
+    recommendation: str | None = None
 
 
 class HumanReviewCompletedPayload(BaseModel):
@@ -195,9 +274,34 @@ class ApplicationSubmittedEvent(BaseEvent):
     payload: ApplicationSubmittedPayload
 
 
+class DocumentUploadRequestedEvent(BaseEvent):
+    event_type: Literal["DocumentUploadRequested"] = "DocumentUploadRequested"
+    payload: DocumentUploadRequestedPayload
+
+
+class DocumentUploadedEvent(BaseEvent):
+    event_type: Literal["DocumentUploaded"] = "DocumentUploaded"
+    payload: DocumentUploadedPayload
+
+
 class CreditAnalysisRequestedEvent(BaseEvent):
     event_type: Literal["CreditAnalysisRequested"] = "CreditAnalysisRequested"
     payload: CreditAnalysisRequestedPayload
+
+
+class FraudScreeningRequestedEvent(BaseEvent):
+    event_type: Literal["FraudScreeningRequested"] = "FraudScreeningRequested"
+    payload: FraudScreeningRequestedPayload
+
+
+class AgentSessionStartedEvent(BaseEvent):
+    event_type: Literal["AgentSessionStarted"] = "AgentSessionStarted"
+    payload: AgentSessionStartedPayload
+
+
+class AgentSessionRecoveredEvent(BaseEvent):
+    event_type: Literal["AgentSessionRecovered"] = "AgentSessionRecovered"
+    payload: AgentSessionRecoveredPayload
 
 
 class AgentContextLoadedEvent(BaseEvent):
@@ -230,10 +334,25 @@ class ComplianceRuleFailedEvent(BaseEvent):
     payload: ComplianceRuleFailedPayload
 
 
+class ComplianceCheckCompletedEvent(BaseEvent):
+    event_type: Literal["ComplianceCheckCompleted"] = "ComplianceCheckCompleted"
+    payload: ComplianceCheckCompletedPayload
+
+
+class DecisionRequestedEvent(BaseEvent):
+    event_type: Literal["DecisionRequested"] = "DecisionRequested"
+    payload: DecisionRequestedPayload
+
+
 class DecisionGeneratedEvent(BaseEvent):
     event_type: Literal["DecisionGenerated"] = "DecisionGenerated"
     event_version: int = 2
     payload: DecisionGeneratedPayload
+
+
+class HumanReviewRequestedEvent(BaseEvent):
+    event_type: Literal["HumanReviewRequested"] = "HumanReviewRequested"
+    payload: HumanReviewRequestedPayload
 
 
 class HumanReviewCompletedEvent(BaseEvent):

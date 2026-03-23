@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel
 
 from src.commands.handlers import (
+    ComplianceCheckCommand,
     CreditAnalysisCompletedCommand,
     FraudScreeningCompletedCommand,
+    GenerateDecisionCommand,
+    StartAgentSessionCommand,
+    SubmitApplicationCommand,
     WriteCommandHandlers,
 )
 from src.models.events import AppendResult, StoredEvent
@@ -234,3 +239,258 @@ async def test_fraud_screening_handler_uses_aggregate_version_and_threads_causal
     assert appended_events[0].metadata["correlation_id"] == "corr-fraud-1"
     assert appended_events[0].metadata["causation_id"] == "cause-fraud-1"
     assert result.new_stream_version == 6
+
+
+@pytest.mark.asyncio
+async def test_submit_application_emits_document_and_analysis_request_events(
+    tmp_path: Path,
+) -> None:
+    application_id = "app-789"
+    document_path = tmp_path / "borrower_report.txt"
+    document_path.write_text("Total Revenue: 1000000\nNet Income: 220000\n", encoding="utf-8")
+
+    store = RecordingStore(streams={})
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_submit_application(
+        SubmitApplicationCommand(
+            application_id=application_id,
+            applicant_id="customer-789",
+            requested_amount_usd=18000.0,
+            loan_purpose="inventory",
+            submission_channel="portal",
+            submitted_at=datetime.now(UTC),
+            document_path=str(document_path),
+            process_documents_after_submit=False,
+            correlation_id="corr-submit-1",
+            causation_id="cause-submit-1",
+        )
+    )
+
+    assert store.operations == [
+        ("load", f"loan-{application_id}"),
+        ("append", f"loan-{application_id}"),
+    ]
+    append_call = store.append_calls[0]
+    event_types = [event.event_type for event in append_call["events"]]
+    assert event_types == [
+        "ApplicationSubmitted",
+        "DocumentUploadRequested",
+        "DocumentUploaded",
+        "CreditAnalysisRequested",
+        "FraudScreeningRequested",
+    ]
+    assert result.new_stream_version == 5
+
+
+@pytest.mark.asyncio
+async def test_start_agent_session_emits_started_and_recovery_events() -> None:
+    agent_id = "credit-agent-2"
+    session_id = "session-new"
+    stream_id = f"agent-{agent_id}-{session_id}"
+
+    store = RecordingStore(streams={})
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_start_agent_session(
+        StartAgentSessionCommand(
+            agent_id=agent_id,
+            session_id=session_id,
+            context_source="prior_session_replay:session-old",
+            event_replay_from_position=15,
+            context_token_count=2048,
+            model_version="credit-v3",
+            correlation_id="corr-session-1",
+            causation_id="cause-session-1",
+        )
+    )
+
+    assert store.operations == [("load", stream_id), ("append", stream_id)]
+    append_call = store.append_calls[0]
+    event_types = [event.event_type for event in append_call["events"]]
+    assert event_types == [
+        "AgentSessionStarted",
+        "AgentSessionRecovered",
+        "AgentContextLoaded",
+    ]
+    assert result.new_stream_version == 3
+
+
+@pytest.mark.asyncio
+async def test_generate_decision_emits_request_and_human_review_markers() -> None:
+    application_id = "app-decision"
+    loan_stream = f"loan-{application_id}"
+    compliance_stream = f"compliance-{application_id}"
+    session_stream = "agent-credit-agent-1-session-1"
+
+    store = RecordingStore(
+        streams={
+            loan_stream: [
+                _stored_event(
+                    stream_id=loan_stream,
+                    stream_position=1,
+                    event_type="ApplicationSubmitted",
+                    payload={
+                        "application_id": application_id,
+                        "requested_amount_usd": 40000,
+                    },
+                ),
+                _stored_event(
+                    stream_id=loan_stream,
+                    stream_position=2,
+                    event_type="CreditAnalysisRequested",
+                    payload={"application_id": application_id},
+                ),
+            ],
+            compliance_stream: [
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=1,
+                    event_type="ComplianceCheckRequested",
+                    payload={
+                        "application_id": application_id,
+                        "regulation_set_version": "2026.03",
+                        "checks_required": ["rule-a"],
+                    },
+                ),
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=2,
+                    event_type="ComplianceRulePassed",
+                    payload={
+                        "application_id": application_id,
+                        "rule_id": "rule-a",
+                        "rule_version": "v1",
+                    },
+                ),
+            ],
+            session_stream: [
+                _stored_event(
+                    stream_id=session_stream,
+                    stream_position=1,
+                    event_type="AgentContextLoaded",
+                    payload={
+                        "agent_id": "credit-agent-1",
+                        "session_id": "session-1",
+                        "context_source": "event-replay",
+                        "event_replay_from_position": 1,
+                        "context_token_count": 1200,
+                        "model_version": "credit-v2",
+                    },
+                ),
+                _stored_event(
+                    stream_id=session_stream,
+                    stream_position=2,
+                    event_type="CreditAnalysisCompleted",
+                    payload={
+                        "application_id": application_id,
+                        "agent_id": "credit-agent-1",
+                        "session_id": "session-1",
+                        "model_version": "credit-v2",
+                        "confidence_score": 0.85,
+                        "risk_tier": "LOW",
+                        "recommended_limit_usd": 35000,
+                        "analysis_duration_ms": 120,
+                        "input_data_hash": "hash-credit",
+                    },
+                ),
+                _stored_event(
+                    stream_id=session_stream,
+                    stream_position=3,
+                    event_type="FraudScreeningCompleted",
+                    payload={
+                        "application_id": application_id,
+                        "agent_id": "credit-agent-1",
+                        "fraud_score": 0.05,
+                        "anomaly_flags": [],
+                        "screening_model_version": "credit-v2",
+                        "input_data_hash": "hash-fraud",
+                    },
+                ),
+            ],
+        }
+    )
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_generate_decision(
+        GenerateDecisionCommand(
+            application_id=application_id,
+            orchestrator_agent_id="orchestrator-1",
+            recommendation="APPROVE",
+            confidence_score=0.9,
+            decision_basis_summary="all clear",
+            contributing_agent_sessions=[session_stream],
+            model_versions={"orchestrator-1": "orch-v1"},
+            correlation_id="corr-decision-1",
+            causation_id="cause-decision-1",
+        )
+    )
+
+    assert store.operations == [
+        ("load", loan_stream),
+        ("load", compliance_stream),
+        ("load", session_stream),
+        ("append", loan_stream),
+    ]
+    append_call = store.append_calls[0]
+    event_types = [event.event_type for event in append_call["events"]]
+    assert event_types == [
+        "DecisionRequested",
+        "DecisionGenerated",
+        "HumanReviewRequested",
+    ]
+    assert result.new_stream_version == 5
+
+
+@pytest.mark.asyncio
+async def test_compliance_check_emits_completed_when_verdict_becomes_terminal() -> None:
+    application_id = "app-compliance"
+    compliance_stream = f"compliance-{application_id}"
+
+    store = RecordingStore(
+        streams={
+            compliance_stream: [
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=1,
+                    event_type="ComplianceCheckRequested",
+                    payload={
+                        "application_id": application_id,
+                        "regulation_set_version": "2026.03",
+                        "checks_required": ["rule-a", "rule-b"],
+                    },
+                ),
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=2,
+                    event_type="ComplianceRulePassed",
+                    payload={
+                        "application_id": application_id,
+                        "rule_id": "rule-a",
+                        "rule_version": "v1",
+                    },
+                ),
+            ]
+        }
+    )
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_compliance_check(
+        ComplianceCheckCommand(
+            application_id=application_id,
+            regulation_set_version="2026.03",
+            rule_id="rule-b",
+            rule_version="v1",
+            passed=True,
+            correlation_id="corr-comp-1",
+            causation_id="cause-comp-1",
+        )
+    )
+
+    assert store.operations == [("load", compliance_stream), ("append", compliance_stream)]
+    append_call = store.append_calls[0]
+    event_types = [event.event_type for event in append_call["events"]]
+    assert event_types == ["ComplianceRulePassed", "ComplianceCheckCompleted"]
+    completion = append_call["events"][-1]
+    assert completion.payload.overall_verdict == "CLEARED"
+    assert result.new_stream_version == 4

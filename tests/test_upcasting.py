@@ -10,6 +10,7 @@ from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
 from src.models.events import CreditAnalysisCompletedEvent
+from src.upcasting.upcasters import upcast_credit_analysis_completed_v1_to_v2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -96,3 +97,29 @@ async def test_credit_analysis_v1_upcasted_to_v2_without_mutating_raw_row(
     assert raw is not None
     assert int(raw["event_version"]) == 1
     assert dict(raw["payload"]) == original_payload
+
+
+def test_credit_upcaster_prefers_payload_model_version() -> None:
+    payload = {
+        "application_id": "app-1",
+        "agent_id": "agent01",
+        "session_id": "s1",
+        "model_version": "credit-v2",
+        "confidence_score": 0.87,
+        "risk_tier": "MEDIUM",
+        "recommended_limit_usd": 50000,
+        "analysis_duration_ms": 142,
+        "input_data_hash": "hash-abc",
+    }
+    metadata = {}
+
+    upcasted_payload, upcasted_metadata = upcast_credit_analysis_completed_v1_to_v2(
+        payload,
+        metadata,
+    )
+
+    assert upcasted_payload["model_version"] == "credit-v2"
+    assert (
+        upcasted_metadata["upcast_notes"]["model_version_inference_method"]
+        == "payload:model_version"
+    )
