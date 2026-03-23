@@ -28,6 +28,10 @@ All code phases are implemented:
 Current integration validation:
 - `27 passed` (full suite with database running)
 
+## Dashboard Preview
+
+![The Ledger Workspace Dashboard](screenshoot/dashboard.png)
+
 ## Architecture Diagram
 
 ```mermaid
