@@ -88,7 +88,7 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
         stream_id=stream_id,
         aggregate_type="LoanApplication",
         events=initial_events,
-        expected_version=0,
+        expected_version=-1,
     )
     assert seeded.new_stream_version == 3
 
@@ -129,8 +129,10 @@ async def test_double_decision_one_winner_one_occ_loser(store: EventStore) -> No
 
     assert len(winners) == 1
     assert len(losers) == 1
+    assert winners[0].new_stream_version == 4
 
     loser = losers[0]
+    assert type(loser) is OptimisticConcurrencyError
     assert loser.expected_version == 3
     assert loser.actual_version == 4
 

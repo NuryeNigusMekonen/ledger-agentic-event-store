@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import asyncpg
 from pydantic import BaseModel
 
 from src.event_store import EventStore
-from src.models.events import BaseEvent, StoredEvent
+from src.models.events import AuditIntegrityCheckRunEvent, BaseEvent, DomainError, StoredEvent
 
 GENESIS_HASH = "GENESIS"
 
@@ -30,8 +32,11 @@ class IntegrityCheckResult:
     stream_id: str
     events_verified_count: int
     chain_valid: bool
+    tamper_detected: bool
     final_hash: str
     violations: list[IntegrityViolation]
+    audit_stream_id: str | None = None
+    audit_event_id: str | None = None
 
 
 def compute_integrity_hash(
@@ -97,6 +102,12 @@ async def run_integrity_check(
     stream_id: str,
     from_position: int = 1,
     to_position: int | None = None,
+    *,
+    append_audit_event: bool = False,
+    audit_entity_type: str | None = None,
+    audit_entity_id: str | None = None,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
 ) -> IntegrityCheckResult:
     events = await _load_raw_stream_events(
         store=store,
@@ -105,6 +116,7 @@ async def run_integrity_check(
         to_position=to_position,
     )
     previous_hash = GENESIS_HASH
+    rolling_chain_hash = GENESIS_HASH
     violations: list[IntegrityViolation] = []
 
     for event in events:
@@ -141,14 +153,66 @@ async def run_integrity_check(
             )
 
         previous_hash = computed_hash
+        rolling_chain_hash = hashlib.sha256(
+            f"{rolling_chain_hash}{computed_hash}".encode("utf-8")
+        ).hexdigest()
 
-    return IntegrityCheckResult(
+    result = IntegrityCheckResult(
         stream_id=stream_id,
         events_verified_count=len(events),
         chain_valid=len(violations) == 0,
-        final_hash=previous_hash,
+        tamper_detected=len(violations) > 0,
+        final_hash=rolling_chain_hash,
         violations=violations,
     )
+    if not append_audit_event:
+        return result
+
+    entity_type = audit_entity_type
+    entity_id = audit_entity_id
+    if entity_type is None or entity_id is None:
+        inferred = _infer_entity_from_stream_id(stream_id)
+        if inferred is None:
+            raise DomainError(
+                "append_audit_event=True requires audit_entity_type/entity_id "
+                "when stream_id cannot be inferred."
+            )
+        entity_type, entity_id = inferred
+
+    audit_stream_id = f"audit-{entity_type}-{entity_id}"
+    previous_audit_hash = await _latest_audit_hash(store=store, audit_stream_id=audit_stream_id)
+    audit_append = await store.append(
+        stream_id=audit_stream_id,
+        aggregate_type="AuditLedger",
+        expected_version=await store.stream_version(audit_stream_id),
+        events=[
+            AuditIntegrityCheckRunEvent(
+                payload={
+                    "entity_id": entity_id,
+                    "check_timestamp": datetime.now(UTC).isoformat(),
+                    "events_verified_count": result.events_verified_count,
+                    "integrity_hash": result.final_hash,
+                    "previous_hash": previous_audit_hash,
+                    "chain_valid": result.chain_valid,
+                    "tamper_detected": result.tamper_detected,
+                },
+                metadata={
+                    "correlation_id": correlation_id or str(uuid4()),
+                    **({"causation_id": causation_id} if causation_id else {}),
+                    "actor_id": "compliance-service",
+                },
+            )
+        ],
+        stream_metadata={
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        },
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+    )
+    result.audit_stream_id = audit_stream_id
+    result.audit_event_id = str(audit_append.events[-1].event_id)
+    return result
 
 
 async def _load_raw_stream_events(
@@ -201,3 +265,26 @@ def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, BaseModel):
         return value.model_dump()
     return dict(value)
+
+
+def _infer_entity_from_stream_id(stream_id: str) -> tuple[str, str] | None:
+    if stream_id.startswith("loan-"):
+        return "application", stream_id[len("loan-") :]
+    if stream_id.startswith("compliance-"):
+        return "compliance_record", stream_id[len("compliance-") :]
+    if stream_id.startswith("agent-"):
+        return "agent_session", stream_id
+    if stream_id.startswith("audit-"):
+        return "audit_ledger", stream_id[len("audit-") :]
+    return None
+
+
+async def _latest_audit_hash(store: EventStore, audit_stream_id: str) -> str | None:
+    audit_events = await store.load_stream(audit_stream_id)
+    for event in reversed(audit_events):
+        if event.event_type != "AuditIntegrityCheckRun":
+            continue
+        value = event.payload.get("integrity_hash")
+        if isinstance(value, str) and value:
+            return value
+    return None

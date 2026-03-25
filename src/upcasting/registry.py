@@ -54,6 +54,26 @@ class UpcasterRegistry:
             fn=fn,
         )
 
+    def upcaster(
+        self,
+        *,
+        event_type: str,
+        from_version: int,
+        to_version: int,
+    ) -> Callable[[UpcasterFn], UpcasterFn]:
+        """Decorator-based registration for upcaster functions."""
+
+        def _register(fn: UpcasterFn) -> UpcasterFn:
+            self.register(
+                event_type=event_type,
+                from_version=from_version,
+                to_version=to_version,
+                fn=fn,
+            )
+            return fn
+
+        return _register
+
     def has_chain(self, event_type: str, version: int) -> bool:
         return (event_type, version) in self._by_key
 

@@ -82,6 +82,7 @@ async def test_integrity_chain_detects_tampering(store: EventStore) -> None:
 
     valid = await run_integrity_check(store, stream_id)
     assert valid.chain_valid is True
+    assert valid.tamper_detected is False
     assert valid.events_verified_count == 2
 
     async with store._pool.acquire() as conn:
@@ -96,6 +97,7 @@ async def test_integrity_chain_detects_tampering(store: EventStore) -> None:
 
     tampered = await run_integrity_check(store, stream_id)
     assert tampered.chain_valid is False
+    assert tampered.tamper_detected is True
     assert len(tampered.violations) >= 1
     assert tampered.violations[0].stream_position == 2
 
@@ -125,6 +127,7 @@ async def test_store_append_auto_attaches_integrity_metadata(store: EventStore) 
 
     result = await run_integrity_check(store, stream_id)
     assert result.chain_valid is True
+    assert result.tamper_detected is False
     assert result.events_verified_count == 2
 
 
@@ -171,6 +174,7 @@ async def test_backfill_integrity_hashes_repairs_legacy_missing_metadata(store: 
 
     invalid_before = await run_integrity_check(store, stream_id)
     assert invalid_before.chain_valid is False
+    assert invalid_before.tamper_detected is True
 
     preview = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=True)
     assert preview.events_repaired == 2
@@ -179,6 +183,7 @@ async def test_backfill_integrity_hashes_repairs_legacy_missing_metadata(store: 
 
     still_invalid = await run_integrity_check(store, stream_id)
     assert still_invalid.chain_valid is False
+    assert still_invalid.tamper_detected is True
 
     applied = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=False)
     assert applied.events_repaired == 2
@@ -187,7 +192,40 @@ async def test_backfill_integrity_hashes_repairs_legacy_missing_metadata(store: 
 
     valid_after = await run_integrity_check(store, stream_id)
     assert valid_after.chain_valid is True
+    assert valid_after.tamper_detected is False
 
     idempotent = await store.backfill_integrity_hashes(stream_id=stream_id, dry_run=False)
     assert idempotent.events_repaired == 0
     assert idempotent.streams_metadata_repaired == 0
+
+
+@pytest.mark.asyncio
+async def test_run_integrity_check_can_append_audit_event(store: EventStore) -> None:
+    stream_id = f"loan-{uuid4()}"
+    await store.append(
+        stream_id=stream_id,
+        aggregate_type="LoanApplication",
+        expected_version=0,
+        events=[
+            ApplicationSubmittedEvent(
+                payload={"application_id": "app-audit", "requested_amount_usd": 5100},
+            ),
+        ],
+    )
+
+    result = await run_integrity_check(
+        store=store,
+        stream_id=stream_id,
+        append_audit_event=True,
+        audit_entity_type="application",
+        audit_entity_id="app-audit",
+    )
+    assert result.chain_valid is True
+    assert result.tamper_detected is False
+    assert result.audit_stream_id == "audit-application-app-audit"
+    assert result.audit_event_id is not None
+
+    audit_events = await store.load_stream("audit-application-app-audit")
+    assert len(audit_events) == 1
+    assert audit_events[0].event_type == "AuditIntegrityCheckRun"
+    assert audit_events[0].payload.get("tamper_detected") is False

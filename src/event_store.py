@@ -108,6 +108,8 @@ class EventStore:
     ) -> AppendResult:
         if not events:
             raise DomainError("append() requires at least one event.")
+        if expected_version < -1:
+            raise DomainError("expected_version must be -1 (new stream) or >= 0.")
 
         metadata_patch = stream_metadata or {}
         effective_outbox_topic = outbox_topic or f"{aggregate_type}.events"
@@ -124,8 +126,10 @@ class EventStore:
                 )
 
                 if stream_row is None:
-                    actual_version = 0
-                    if expected_version != 0:
+                    # New stream semantic: expected_version = -1.
+                    # expected_version = 0 remains accepted for backward compatibility.
+                    actual_version = -1
+                    if expected_version not in {-1, 0}:
                         raise OptimisticConcurrencyError(
                             stream_id=stream_id,
                             expected_version=expected_version,
@@ -155,6 +159,12 @@ class EventStore:
                         )
                     if stream_row["archived_at"] is not None:
                         raise StreamArchivedError(stream_id)
+                    if expected_version == -1:
+                        raise OptimisticConcurrencyError(
+                            stream_id=stream_id,
+                            expected_version=expected_version,
+                            actual_version=current_version,
+                        )
                     if current_version != expected_version:
                         raise OptimisticConcurrencyError(
                             stream_id=stream_id,
@@ -288,9 +298,65 @@ class EventStore:
         self,
         stream_id: str,
         from_position: int = 1,
+        to_position: int | None = None,
         limit: int | None = None,
     ) -> list[StoredEvent]:
-        if limit is not None:
+        if from_position < 1:
+            raise DomainError("load_stream() requires from_position >= 1.")
+        if to_position is not None and to_position < from_position:
+            raise DomainError("load_stream() requires to_position >= from_position.")
+        if limit is not None and limit <= 0:
+            raise DomainError("load_stream() requires limit > 0 when provided.")
+
+        if to_position is not None and limit is not None:
+            rows = await self._pool.fetch(
+                """
+                SELECT
+                  event_id,
+                  stream_id,
+                  stream_position,
+                  global_position,
+                  event_type,
+                  event_version,
+                  payload,
+                  metadata,
+                  recorded_at
+                FROM events
+                WHERE stream_id = $1
+                  AND stream_position >= $2
+                  AND stream_position <= $3
+                ORDER BY stream_position ASC
+                LIMIT $4
+                """,
+                stream_id,
+                from_position,
+                to_position,
+                limit,
+            )
+        elif to_position is not None:
+            rows = await self._pool.fetch(
+                """
+                SELECT
+                  event_id,
+                  stream_id,
+                  stream_position,
+                  global_position,
+                  event_type,
+                  event_version,
+                  payload,
+                  metadata,
+                  recorded_at
+                FROM events
+                WHERE stream_id = $1
+                  AND stream_position >= $2
+                  AND stream_position <= $3
+                ORDER BY stream_position ASC
+                """,
+                stream_id,
+                from_position,
+                to_position,
+            )
+        elif limit is not None:
             rows = await self._pool.fetch(
                 """
                 SELECT
@@ -342,10 +408,26 @@ class EventStore:
         from_global_position: int = 0,
         limit: int | None = None,
         batch_size: int = 500,
+        event_types: list[str] | tuple[str, ...] | set[str] | None = None,
         event_type: str | None = None,
     ) -> AsyncIterator[list[StoredEvent]]:
+        if from_global_position < 0:
+            raise DomainError("load_all() requires from_global_position >= 0.")
         if batch_size <= 0:
             raise DomainError("load_all() requires batch_size > 0.")
+        if limit is not None and limit <= 0:
+            raise DomainError("load_all() requires limit > 0 when provided.")
+
+        filtered_event_types: list[str] | None = None
+        if event_types is not None:
+            filtered_event_types = [item for item in event_types if item]
+        if event_type:
+            if filtered_event_types is None:
+                filtered_event_types = [event_type]
+            elif event_type not in filtered_event_types:
+                filtered_event_types.append(event_type)
+        if filtered_event_types is not None and not filtered_event_types:
+            filtered_event_types = None
 
         cursor = from_global_position
         remaining = limit
@@ -355,7 +437,7 @@ class EventStore:
             if fetch_limit <= 0:
                 break
 
-            if event_type is None:
+            if filtered_event_types is None:
                 rows = await self._pool.fetch(
                     """
                     SELECT
@@ -390,12 +472,13 @@ class EventStore:
                       metadata,
                       recorded_at
                     FROM events
-                    WHERE global_position > $1 AND event_type = $2
+                    WHERE global_position > $1
+                      AND event_type = ANY($2::text[])
                     ORDER BY global_position ASC
                     LIMIT $3
                     """,
                     cursor,
-                    event_type,
+                    filtered_event_types,
                     fetch_limit,
                 )
 
@@ -694,14 +777,22 @@ def _row_to_stored_event(
     event_version = int(row["event_version"])
 
     if registry is not None:
+        upcast_metadata = dict(metadata)
+        upcast_metadata["__recorded_at"] = row["recorded_at"].isoformat()
+        upcast_metadata["__stream_id"] = row["stream_id"]
+        upcast_metadata["__stream_position"] = int(row["stream_position"])
         upcasted = registry.upcast(
             event_type=row["event_type"],
             version=event_version,
             payload=payload,
-            metadata=metadata,
+            metadata=upcast_metadata,
         )
         payload = upcasted.payload
-        metadata = upcasted.metadata
+        metadata = {
+            key: value
+            for key, value in upcasted.metadata.items()
+            if key not in {"__recorded_at", "__stream_id", "__stream_position"}
+        }
         event_version = upcasted.current_version
 
     return StoredEvent(

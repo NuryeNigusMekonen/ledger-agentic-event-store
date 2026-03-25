@@ -74,5 +74,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_topic
 CREATE INDEX IF NOT EXISTS idx_outbox_status_next_attempt
   ON outbox (status, next_attempt_at);
 
-COMMIT;
+CREATE TABLE IF NOT EXISTS outbox_sink_events (
+  sink_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  outbox_id BIGINT NOT NULL UNIQUE REFERENCES outbox(outbox_id) ON DELETE CASCADE,
+  event_id UUID NOT NULL,
+  topic TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+  delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
+CREATE INDEX IF NOT EXISTS idx_outbox_sink_topic_delivered
+  ON outbox_sink_events (topic, delivered_at DESC);
+
+COMMIT;

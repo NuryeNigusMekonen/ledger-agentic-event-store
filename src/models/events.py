@@ -78,6 +78,72 @@ class DocumentUploadedPayload(BaseModel):
     document_path: str | None = None
 
 
+class PackageCreatedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    package_id: str
+    created_at: str
+
+
+class DocumentAddedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    document_path: str
+    document_type: str
+    added_at: str
+
+
+class DocumentFormatValidatedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    document_path: str
+    format: str
+    is_supported: bool
+
+
+class ExtractionStartedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    document_path: str
+    started_at: str
+    pipeline: str
+
+
+class ExtractionCompletedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    document_path: str
+    facts: dict[str, Any]
+    field_confidence: dict[str, float]
+    extraction_notes: list[str] = Field(default_factory=list)
+    completed_at: str
+
+
+class QualityAssessmentCompletedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    overall_confidence: float = Field(ge=0.0, le=1.0)
+    is_coherent: bool
+    anomalies: list[str] = Field(default_factory=list)
+    critical_missing_fields: list[str] = Field(default_factory=list)
+    reextraction_recommended: bool
+    auditor_notes: str | None = None
+
+
+class PackageReadyForAnalysisPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str
+    package_id: str
+    ready_at: str
+
+
 class CreditAnalysisRequestedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -144,6 +210,7 @@ class CreditAnalysisCompletedPayload(BaseModel):
     confidence_score: float | None = Field(default=None, ge=0.0, le=1.0)
     risk_tier: str | None = None
     analysis_duration_ms: int | None = Field(default=None, ge=0)
+    regulatory_basis: str | None = None
 
 
 class FraudScreeningCompletedPayload(BaseModel):
@@ -267,6 +334,8 @@ class AuditIntegrityCheckRunPayload(BaseModel):
     integrity_hash: str
     check_timestamp: str | None = None
     previous_hash: str | None = None
+    chain_valid: bool | None = None
+    tamper_detected: bool | None = None
 
 
 class ApplicationSubmittedEvent(BaseEvent):
@@ -282,6 +351,41 @@ class DocumentUploadRequestedEvent(BaseEvent):
 class DocumentUploadedEvent(BaseEvent):
     event_type: Literal["DocumentUploaded"] = "DocumentUploaded"
     payload: DocumentUploadedPayload
+
+
+class PackageCreatedEvent(BaseEvent):
+    event_type: Literal["PackageCreated"] = "PackageCreated"
+    payload: PackageCreatedPayload
+
+
+class DocumentAddedEvent(BaseEvent):
+    event_type: Literal["DocumentAdded"] = "DocumentAdded"
+    payload: DocumentAddedPayload
+
+
+class DocumentFormatValidatedEvent(BaseEvent):
+    event_type: Literal["DocumentFormatValidated"] = "DocumentFormatValidated"
+    payload: DocumentFormatValidatedPayload
+
+
+class ExtractionStartedEvent(BaseEvent):
+    event_type: Literal["ExtractionStarted"] = "ExtractionStarted"
+    payload: ExtractionStartedPayload
+
+
+class ExtractionCompletedEvent(BaseEvent):
+    event_type: Literal["ExtractionCompleted"] = "ExtractionCompleted"
+    payload: ExtractionCompletedPayload
+
+
+class QualityAssessmentCompletedEvent(BaseEvent):
+    event_type: Literal["QualityAssessmentCompleted"] = "QualityAssessmentCompleted"
+    payload: QualityAssessmentCompletedPayload
+
+
+class PackageReadyForAnalysisEvent(BaseEvent):
+    event_type: Literal["PackageReadyForAnalysis"] = "PackageReadyForAnalysis"
+    payload: PackageReadyForAnalysisPayload
 
 
 class CreditAnalysisRequestedEvent(BaseEvent):
