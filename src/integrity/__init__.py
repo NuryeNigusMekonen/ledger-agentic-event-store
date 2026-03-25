@@ -8,7 +8,7 @@ from .audit_chain import (
     compute_integrity_hash,
     run_integrity_check,
 )
-from .gas_town import ReconstructedContext, reconstruct_agent_context
+from .gas_town import AgentContext, PendingWorkItem, ReconstructedContext, reconstruct_agent_context
 
 __all__ = [
     "GENESIS_HASH",
@@ -17,7 +17,8 @@ __all__ = [
     "compute_integrity_hash",
     "attach_integrity_chain",
     "run_integrity_check",
+    "AgentContext",
+    "PendingWorkItem",
     "ReconstructedContext",
     "reconstruct_agent_context",
 ]
-
