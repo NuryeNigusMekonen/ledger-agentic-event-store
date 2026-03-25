@@ -16,6 +16,7 @@ export type ProjectionLag = {
   latest_position: number;
   events_behind: number;
   lag_ms: number;
+  checkpoint_age_ms: number;
   status: string;
   updated_at: string;
 };

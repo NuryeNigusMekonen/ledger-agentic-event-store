@@ -1,6 +1,6 @@
 # Ledger Agentic Event Store
 
-Production-style implementation of **TRP1 Week 5: The Ledger**.
+Production-style implementation of **The Ledger**.
 
 This repository implements the challenge end-to-end across:
 - Event store core (PostgreSQL + optimistic concurrency)
@@ -137,7 +137,7 @@ flowchart TB
     META[Correlation causation actor metadata]
     UPCAST[Upcaster registry on reads]
     INTEGRITY[Integrity hash chain]
-    OUTBOX[Outbox schema optional not wired in main flow]
+    OUTBOX[Outbox + relay worker + local sink delivery log]
   end
 
   E2 --> STORE
@@ -240,6 +240,26 @@ migrations/
 scripts/
 ```
 
+## Outbox End-to-End (Broker-Free)
+
+The project now includes a full outbox relay loop without requiring Kafka/Redis/Rabbit:
+
+- Writes append to `events` and `outbox` in one transaction (`EventStore.append`).
+- `scripts/run_outbox_relay.py` runs a separate relay process.
+- Relay claims pending outbox rows, publishes to `outbox_sink_events`, retries with backoff, and dead-letters after max attempts.
+
+Run one relay batch:
+
+```bash
+make outbox-relay ARGS="--once"
+```
+
+Run continuously:
+
+```bash
+make outbox-relay
+```
+
 ## Week 3 Refinery Integration
 
 This repo now includes a full local **Document Intelligence Refinery** pipeline under `src/refinery/`:
@@ -273,7 +293,7 @@ python scripts/run_refinery.py /path/to/document.pdf --gemini-api-key your_key_h
 
 When `GEMINI_API_KEY` is not set (or if Gemini is unreachable), the pipeline falls back to deterministic local extraction.
 
-Week 5 integration entry point (compatible with support doc import style):
+integration entry point (compatible with support doc import style):
 
 ```python
 from document_refinery.pipeline import extract_financial_facts

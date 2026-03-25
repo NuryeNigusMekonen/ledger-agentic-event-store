@@ -8,7 +8,7 @@ RUFF ?= .venv/bin/ruff
 NPM ?= npm
 WEB_DIR := apps/web
 
-.PHONY: help setup db-start db-stop db-status migrate api web web-install test test-api lint check backfill-integrity
+.PHONY: help setup db-start db-stop db-status migrate api web web-install test test-api lint check backfill-integrity outbox-relay
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; print "Available targets:"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -50,3 +50,6 @@ check: lint test ## Run lint and tests
 
 backfill-integrity: ## Backfill integrity metadata (dry-run). Example: make backfill-integrity ARGS="--apply --mode missing"
 	$(PYTHON) scripts/backfill_integrity_hashes.py $(ARGS)
+
+outbox-relay: ## Run outbox relay worker once. Example: make outbox-relay ARGS="--once"
+	$(PYTHON) scripts/run_outbox_relay.py $(ARGS)

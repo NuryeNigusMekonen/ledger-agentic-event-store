@@ -858,28 +858,40 @@ function AgentPipelineFlow(props: {
       </div>
 
       <div className="pipeline-flow">
-        {props.stages.map((stage, index) => (
-          <div className="pipeline-segment" key={stage.name}>
-            <article
-              className={`pipeline-step tone-${stage.tone} ${stage.name === "HumanReview" ? "pipeline-step-human" : ""}`}
-            >
-              <div className="fabric-header">
-                <strong>{stage.name}</strong>
-                <StatusBadge label={stage.status} tone={stage.tone} />
-              </div>
-              {!props.compact ? <span className="fabric-role">{stage.role}</span> : null}
-              <div className="fabric-meta">
-                <span>{stage.latestEvent}</span>
-                <time>{stage.latestAt}</time>
-              </div>
-            </article>
-            {!props.compact && index < props.stages.length - 1 ? (
-              <div className="pipeline-arrow" aria-hidden="true">
-                <span>&rarr;</span>
-              </div>
-            ) : null}
-          </div>
-        ))}
+        {props.stages.map((stage, index) => {
+          const hoverDetails = [
+            `Agent: ${stage.name}`,
+            `Role: ${stage.role}`,
+            `Status: ${stage.status}`,
+            `Latest event: ${stage.latestEvent}`,
+            `Last update: ${stage.latestAt}`
+          ].join("\n");
+
+          return (
+            <div className="pipeline-segment" key={stage.name}>
+              <article
+                className={`pipeline-step tone-${stage.tone} ${stage.name === "HumanReview" ? "pipeline-step-human" : ""}`}
+                title={hoverDetails}
+                aria-label={hoverDetails}
+              >
+                <div className="fabric-header">
+                  <strong>{stage.name}</strong>
+                  <StatusBadge label={stage.status} tone={stage.tone} />
+                </div>
+                {!props.compact ? <span className="fabric-role">{stage.role}</span> : null}
+                <div className="fabric-meta">
+                  <span>{stage.latestEvent}</span>
+                  <time>{stage.latestAt}</time>
+                </div>
+              </article>
+              {!props.compact && index < props.stages.length - 1 ? (
+                <div className="pipeline-arrow" aria-hidden="true">
+                  <span>&rarr;</span>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -973,6 +985,7 @@ function ProjectionHealthPanel(props: {
       latest_position: number;
       events_behind: number;
       lag_ms: number;
+      checkpoint_age_ms: number;
       status: string;
       updated_at: string;
     };
@@ -1015,6 +1028,10 @@ function ProjectionHealthPanel(props: {
                   <div>
                     <span>Lag</span>
                     <strong>{formatLagMs(lag.lag_ms)}</strong>
+                  </div>
+                  <div>
+                    <span>Checkpoint age</span>
+                    <strong>{formatLagMs(lag.checkpoint_age_ms)}</strong>
                   </div>
                   <div>
                     <span>Severity</span>
@@ -1528,19 +1545,9 @@ function assessProjection(lag: {
   lag_ms: number;
   status: string;
 }): ProjectionAssessment {
-  const normalized = String(lag.status).toLowerCase();
   const hasBacklog = lag.events_behind > 0;
 
   if (!hasBacklog) {
-    if (normalized.includes("critical") || normalized.includes("warning") || lag.lag_ms > 300_000) {
-      return {
-        tone: "warning",
-        statusLabel: "Synced with warning",
-        severityLabel: normalized.includes("critical") || lag.lag_ms > 300_000 ? "Critical lag" : "Warning lag",
-        explanation: "No backlog; projection timer elevated.",
-        isSynced: true
-      };
-    }
     return {
       tone: "ok",
       statusLabel: "Synced",
@@ -2699,7 +2706,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <div className="page-shell">
-        <header className="identity-bar panel">
+        <header className="identity-bar identity-bar-constrained panel">
           <div className="identity-main">
             <img className="apex-logo" src={apexLogo} alt="Apex Financial Services" />
             <div className="identity-copy">

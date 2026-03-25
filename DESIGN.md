@@ -114,3 +114,41 @@ Improved approach:
 Why this matters:
 - Better write throughput, faster projection replay, and cleaner hot/cold storage separation without losing audit integrity.
 
+## 7) DocumentPackage as a Future Aggregate Boundary
+Current implementation:
+- The system currently runs with four aggregates: `LoanApplication`, `AgentSession`, `ComplianceRecord`, and `AuditLedger`.
+
+Observation:
+- Document-related events form a distinct lifecycle: `PackageCreated`, `DocumentAdded`, `DocumentFormatValidated`, `ExtractionStarted`, `ExtractionCompleted`, `QualityAssessmentCompleted`, `PackageReadyForAnalysis`, `DocumentUploadRequested`, and `DocumentUploaded`.
+
+Problem:
+- These events represent their own state transitions and business rules (document validation, extraction flow, quality checks, and readiness gating).
+- They are not purely loan lifecycle transitions even when they are correlated to a loan application.
+
+Conclusion:
+- `DocumentPackage` is a natural aggregate boundary because it owns:
+- document state
+- extraction progress
+- quality assessment
+- readiness for analysis
+
+Current decision:
+- The implementation intentionally keeps the current four-aggregate model for delivery stability and to avoid introducing migration risk in the current release.
+
+Future refinement:
+- Extract `DocumentPackage` as a 5th aggregate with its own stream.
+- Example stream format: `docpkg-{package_id}`.
+
+Event ownership mapping (current vs future):
+
+| Event | Current Aggregate | Future Aggregate |
+|---|---|---|
+| `DocumentUploadRequested` | `LoanApplication` | `DocumentPackage` |
+| `DocumentUploaded` | `LoanApplication` | `DocumentPackage` |
+| `PackageCreated` | (implicit / document workflow stream) | `DocumentPackage` |
+| `DocumentAdded` | (implicit / document workflow stream) | `DocumentPackage` |
+| `DocumentFormatValidated` | (implicit / document workflow stream) | `DocumentPackage` |
+| `ExtractionStarted` | (implicit / document workflow stream) | `DocumentPackage` |
+| `ExtractionCompleted` | (implicit / document workflow stream) | `DocumentPackage` |
+| `QualityAssessmentCompleted` | (implicit / document workflow stream) | `DocumentPackage` |
+| `PackageReadyForAnalysis` | (implicit / document workflow stream) | `DocumentPackage` |
