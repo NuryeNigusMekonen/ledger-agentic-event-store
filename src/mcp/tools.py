@@ -13,7 +13,6 @@ from src.commands.handlers import (
     FraudScreeningCompletedCommand,
     GenerateDecisionCommand,
     HumanReviewCompletedCommand,
-    RunIntegrityCheckCommand,
     StartAgentSessionCommand,
     SubmitApplicationCommand,
     WriteCommandHandlers,
@@ -154,59 +153,72 @@ class LedgerMCPTools:
             {
                 "name": "submit_application",
                 "description": (
-                    "Create ApplicationSubmitted event. Precondition: application_id must not "
-                    "already exist; duplicate IDs return PreconditionFailed. Optional: provide "
-                    "document_path + process_documents_after_submit=true to run refinery "
-                    "extraction, append docpkg lifecycle events, and then trigger "
-                    "CreditAnalysisRequested."
+                    "Create ApplicationSubmitted. Preconditions: application_id must be unique; "
+                    "requested_amount_usd must be > 0; if process_documents_after_submit=true, "
+                    "document_path must point to an existing readable file. "
+                    "Action when blocked: choose a new application_id or fix document_path."
                 ),
                 "input_schema": SubmitApplicationInput.model_json_schema(),
             },
             {
                 "name": "start_agent_session",
                 "description": (
-                    "Create AgentContextLoaded event. Precondition: must be called before "
-                    "record_credit_analysis or record_fraud_screening for the same session."
+                    "Create AgentSessionStarted + AgentContextLoaded. Preconditions: this "
+                    "agent_id+session_id must not already be initialized; context_token_count "
+                    "must be > 0; event_replay_from_position must be >= 0. Action when blocked: "
+                    "use a new session_id or load existing session state first."
                 ),
                 "input_schema": StartAgentSessionInput.model_json_schema(),
             },
             {
                 "name": "record_credit_analysis",
                 "description": (
-                    "Create CreditAnalysisCompleted event. Precondition: active agent session with "
-                    "context loaded and matching model_version."
+                    "Create CreditAnalysisCompleted. Preconditions: start_agent_session must "
+                    "already have run for this session; session model_version must match; "
+                    "confidence_score in [0,1]; recommended_limit_usd > 0. Action when blocked: "
+                    "start/recover session and resend with valid numeric bounds."
                 ),
                 "input_schema": RecordCreditAnalysisInput.model_json_schema(),
             },
             {
                 "name": "record_fraud_screening",
                 "description": (
-                    "Create FraudScreeningCompleted event. Precondition: active agent session with "
-                    "context loaded and 0.0 <= fraud_score <= 1.0."
+                    "Create FraudScreeningCompleted. Preconditions: start_agent_session must "
+                    "already have run for this session; screening_model_version must match the "
+                    "session; fraud_score in [0,1]. Action when blocked: start/recover session "
+                    "and resend with valid score."
                 ),
                 "input_schema": RecordFraudScreeningInput.model_json_schema(),
             },
             {
                 "name": "record_compliance_check",
                 "description": (
-                    "Create ComplianceRulePassed or ComplianceRuleFailed. Precondition: rule must "
-                    "belong to active regulation set for initialized streams."
+                    "Create ComplianceRulePassed/Failed (and ComplianceCheckCompleted when "
+                    "terminal). Preconditions: on first check, provide checks_required; on later "
+                    "checks, rule_id must be in mandatory checks and regulation_set_version must "
+                    "match active stream. Action when blocked: fetch compliance timeline and use "
+                    "a valid pending rule."
                 ),
                 "input_schema": RecordComplianceCheckInput.model_json_schema(),
             },
             {
                 "name": "generate_decision",
                 "description": (
-                    "Create DecisionGenerated event. Preconditions: required analyses present, "
-                    "compliance not pending, and confidence_score >= 0.50."
+                    "Create DecisionRequested + DecisionGenerated. Preconditions: "
+                    "contributing_agent_sessions must already contain both credit and fraud "
+                    "completed events; compliance stream must already be terminal (CLEARED or "
+                    "FAILED). Action when blocked: record missing analyses/compliance events then "
+                    "retry; low confidence can auto-convert recommendation to REFER."
                 ),
                 "input_schema": GenerateDecisionInput.model_json_schema(),
             },
             {
                 "name": "record_human_review",
                 "description": (
-                    "Create HumanReviewCompleted and final approval/decline event. Precondition: "
-                    "if override=true then override_reason is required."
+                    "Create HumanReviewCompleted + final ApplicationApproved/Declined. "
+                    "Preconditions: a decision must already exist; application must be in pending "
+                    "human-review state; if override=true, override_reason is required. Action "
+                    "when blocked: generate decision first or provide required override fields."
                 ),
                 "input_schema": RecordHumanReviewInput.model_json_schema(),
             },
@@ -214,7 +226,9 @@ class LedgerMCPTools:
                 "name": "run_integrity_check",
                 "description": (
                     "Run SHA-256 audit chain verification and append AuditIntegrityCheckRun. "
-                    "Precondition: role must be compliance or admin; rate limit 1/minute/entity."
+                    "Preconditions: role must be compliance/admin; max 1 call per minute for the "
+                    "same entity_type+entity_id. Action when blocked: retry after cooldown or use "
+                    "authorized role."
                 ),
                 "input_schema": RunIntegrityCheckInput.model_json_schema(),
             },
@@ -237,6 +251,7 @@ class LedgerMCPTools:
                 error_type="UnknownTool",
                 message=f"Unknown tool '{tool_name}'.",
                 suggested_action="use_list_tools",
+                context={"tool_name": tool_name},
             )
         try:
             return await handler(arguments)
@@ -245,14 +260,15 @@ class LedgerMCPTools:
                 error_type="ValidationError",
                 message="Input schema validation failed.",
                 suggested_action="fix_input_and_retry",
-                details=exc.errors(),
+                context={"validation_errors": exc.errors(), "tool_name": tool_name},
             )
         except OptimisticConcurrencyError as exc:
             return _error(
                 error_type="OptimisticConcurrencyError",
                 message=str(exc),
                 suggested_action=exc.suggested_action,
-                details={
+                context={
+                    "tool_name": tool_name,
                     "stream_id": exc.stream_id,
                     "expected_version": exc.expected_version,
                     "actual_version": exc.actual_version,
@@ -263,12 +279,14 @@ class LedgerMCPTools:
                 error_type="DomainError",
                 message=str(exc),
                 suggested_action="review_preconditions_and_retry",
+                context={"tool_name": tool_name},
             )
         except Exception as exc:  # pragma: no cover - defensive
             return _error(
                 error_type="InternalError",
                 message=f"Unexpected tool failure: {exc}",
                 suggested_action="inspect_logs_and_retry",
+                context={"tool_name": tool_name, "exception_type": type(exc).__name__},
             )
 
     async def submit_application(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -280,7 +298,7 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message=f"Application '{params.application_id}' already exists.",
                 suggested_action="use_unique_application_id",
-                details={"stream_id": stream_id},
+                context={"stream_id": stream_id, "application_id": params.application_id},
             )
 
         result = await self.handlers.handle_submit_application(
@@ -339,7 +357,7 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message="No active session context. Call start_agent_session first.",
                 suggested_action="call_start_agent_session_then_retry",
-                details={"stream_id": session_stream},
+                context={"stream_id": session_stream, "session_id": params.session_id},
             )
 
         result = await self.handlers.handle_credit_analysis_completed(
@@ -375,7 +393,7 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message="No active session context. Call start_agent_session first.",
                 suggested_action="call_start_agent_session_then_retry",
-                details={"stream_id": session_stream},
+                context={"stream_id": session_stream, "session_id": params.session_id},
             )
 
         result = await self.handlers.handle_fraud_screening_completed(
@@ -409,7 +427,11 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message=f"Rule '{params.rule_id}' is not in active regulation check set.",
                 suggested_action="use_valid_rule_id_for_regulation_set",
-                details={"mandatory_checks": sorted(compliance.mandatory_checks)},
+                context={
+                    "rule_id": params.rule_id,
+                    "mandatory_checks": sorted(compliance.mandatory_checks),
+                    "application_id": params.application_id,
+                },
             )
 
         result = await self.handlers.handle_compliance_check(
@@ -442,13 +464,6 @@ class LedgerMCPTools:
     async def generate_decision(self, arguments: dict[str, Any]) -> dict[str, Any]:
         params = GenerateDecisionInput.model_validate(arguments)
 
-        if params.confidence_score < 0.50:
-            return _error(
-                error_type="PreconditionFailed",
-                message="confidence_score must be >= 0.50 for generate_decision.",
-                suggested_action="raise_confidence_or_use_REFER",
-            )
-
         has_credit = False
         has_fraud = False
         for stream_id in params.contributing_agent_sessions:
@@ -462,7 +477,11 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message="Required analyses are missing (credit and fraud are required).",
                 suggested_action="record_missing_analyses_then_retry",
-                details={"has_credit": has_credit, "has_fraud": has_fraud},
+                context={
+                    "has_credit": has_credit,
+                    "has_fraud": has_fraud,
+                    "contributing_agent_sessions": params.contributing_agent_sessions,
+                },
             )
 
         result = await self.handlers.handle_generate_decision(
@@ -487,7 +506,7 @@ class LedgerMCPTools:
             "ok": True,
             "result": {
                 "decision_id": str(decision_event.event_id),
-                "recommendation": params.recommendation.upper(),
+                "recommendation": str(decision_event.payload.get("recommendation", "")).upper(),
             },
         }
 
@@ -498,6 +517,7 @@ class LedgerMCPTools:
                 error_type="PreconditionFailed",
                 message="override_reason is required when override=true.",
                 suggested_action="provide_override_reason_and_retry",
+                context={"application_id": params.application_id, "override": params.override},
             )
 
         result = await self.handlers.handle_human_review_completed(
@@ -532,6 +552,7 @@ class LedgerMCPTools:
                 error_type="AuthorizationError",
                 message="run_integrity_check requires compliance or admin role.",
                 suggested_action="use_admin_or_compliance_credentials",
+                context={"role": params.role, "entity_type": params.entity_type},
             )
 
         entity_key = f"{params.entity_type}:{params.entity_id}"
@@ -542,30 +563,21 @@ class LedgerMCPTools:
                 error_type="RateLimitExceeded",
                 message="run_integrity_check is limited to 1 call/minute per entity.",
                 suggested_action="retry_after_cooldown",
+                context={
+                    "entity_key": entity_key,
+                    "next_allowed_at": (previous_time + timedelta(minutes=1)).isoformat(),
+                },
             )
 
         target_stream = _entity_stream_id(params.entity_type, params.entity_id)
-        check_result = await run_integrity_check(self.store, target_stream)
-
-        audit_stream = f"audit-{params.entity_type}-{params.entity_id}"
-        audit_events = await self.store.load_stream(audit_stream)
-        previous_hash = None
-        for event in reversed(audit_events):
-            if event.event_type == "AuditIntegrityCheckRun":
-                previous_hash = event.payload.get("integrity_hash")
-                break
-
-        append_result = await self.handlers.handle_run_integrity_check(
-            RunIntegrityCheckCommand(
-                entity_type=params.entity_type,
-                entity_id=params.entity_id,
-                events_verified_count=check_result.events_verified_count,
-                integrity_hash=check_result.final_hash,
-                previous_hash=previous_hash,
-                role=params.role,
-                correlation_id=params.correlation_id,
-                causation_id=params.causation_id,
-            )
+        check_result = await run_integrity_check(
+            self.store,
+            target_stream,
+            append_audit_event=True,
+            audit_entity_type=params.entity_type,
+            audit_entity_id=params.entity_id,
+            correlation_id=params.correlation_id,
+            causation_id=params.causation_id,
         )
         self._integrity_rate_limit[entity_key] = now
         await self._after_write()
@@ -574,9 +586,10 @@ class LedgerMCPTools:
             "result": {
                 "check_result": "valid" if check_result.chain_valid else "invalid",
                 "chain_valid": check_result.chain_valid,
+                "tamper_detected": check_result.tamper_detected,
                 "events_verified_count": check_result.events_verified_count,
                 "violation_count": len(check_result.violations),
-                "audit_event_id": str(append_result.events[-1].event_id),
+                "audit_event_id": check_result.audit_event_id,
             },
         }
 
@@ -604,13 +617,12 @@ def _error(
     error_type: str,
     message: str,
     suggested_action: str,
-    details: Any | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     error = {
         "error_type": error_type,
         "message": message,
+        "context": context or {},
         "suggested_action": suggested_action,
     }
-    if details is not None:
-        error["details"] = details
     return {"ok": False, "error": error}

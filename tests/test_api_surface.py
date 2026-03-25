@@ -112,3 +112,4 @@ def test_api_bootstrap_and_views() -> None:
         metrics = client.get("/api/v1/metrics", headers=headers)
         assert metrics.status_code == 200
         assert "ledger_projection_events_behind" in metrics.text
+        assert "ledger_projection_checkpoint_age_ms" in metrics.text

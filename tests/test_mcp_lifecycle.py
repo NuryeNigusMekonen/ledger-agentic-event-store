@@ -11,6 +11,15 @@ from dotenv import dotenv_values, load_dotenv
 
 from src.event_store import EventStore
 from src.mcp.server import LedgerMCPServer
+from src.models.events import (
+    AgentContextLoadedEvent,
+    ApplicationSubmittedEvent,
+    ComplianceCheckRequestedEvent,
+    ComplianceRulePassedEvent,
+    CreditAnalysisCompletedEvent,
+    CreditAnalysisRequestedEvent,
+    FraudScreeningCompletedEvent,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -186,7 +195,12 @@ async def test_mcp_full_lifecycle_via_tools_and_resources(server: LedgerMCPServe
     compliance_view = await server.read_resource(f"ledger://applications/{app_id}/compliance")
     assert compliance_view["ok"] is True
     assert compliance_view["result"]["snapshot"]["compliance_status"] == "CLEARED"
-    assert len(compliance_view["result"]["timeline"]) >= 3
+    timeline_event_types = [
+        row["event_type"] for row in compliance_view["result"]["timeline"]
+    ]
+    assert "ComplianceCheckRequested" in timeline_event_types
+    assert "ComplianceCheckCompleted" in timeline_event_types
+    assert timeline_event_types.count("ComplianceRulePassed") == 2
 
     app_summary = await server.read_resource(f"ledger://applications/{app_id}")
     assert app_summary["ok"] is True
@@ -224,6 +238,8 @@ async def test_mcp_returns_structured_precondition_error(server: LedgerMCPServer
     assert result["ok"] is False
     assert result["error"]["error_type"] == "PreconditionFailed"
     assert "suggested_action" in result["error"]
+    assert "context" in result["error"]
+    assert isinstance(result["error"]["context"], dict)
 
 
 @pytest.mark.asyncio
@@ -273,3 +289,139 @@ async def test_submit_application_can_process_document_and_emit_docpkg_events(
 
     loan_events = await server.store.load_stream(f"loan-{app_id}")
     assert any(event.event_type == "CreditAnalysisRequested" for event in loan_events)
+
+
+@pytest.mark.asyncio
+async def test_ledger_health_handles_null_confidence_event(server: LedgerMCPServer) -> None:
+    app_id = f"app-{uuid4()}"
+    agent_id = f"agent-null-confidence-{uuid4()}"
+    session_id = "s-null"
+    stream_id = f"agent-{agent_id}-{session_id}"
+
+    await server.store.append(
+        stream_id=stream_id,
+        aggregate_type="AgentSession",
+        expected_version=0,
+        events=[
+            AgentContextLoadedEvent(
+                payload={
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "model_version": "credit-v1",
+                }
+            ),
+            CreditAnalysisCompletedEvent(
+                payload={
+                    "application_id": app_id,
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "model_version": "credit-v1",
+                    "confidence_score": None,
+                    "recommended_limit_usd": 5000,
+                }
+            ),
+        ],
+    )
+
+    health = await server.read_resource("ledger://ledger/health")
+    assert health["ok"] is True
+    assert "agent_performance_ledger" in health["result"]["projections"]
+
+    performance = await server.read_resource(f"ledger://agents/{agent_id}/performance")
+    assert performance["ok"] is True
+    assert performance["result"]["models"]
+    model_metrics = performance["result"]["models"][0]
+    assert model_metrics["analyses_completed"] == 1
+    assert model_metrics["confidence_samples"] == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_decision_returns_effective_refer_when_confidence_low(
+    server: LedgerMCPServer,
+) -> None:
+    app_id = f"app-{uuid4()}"
+    agent_id = "credit-low-confidence"
+    session_id = "session-low"
+    session_stream = f"agent-{agent_id}-{session_id}"
+
+    await server.store.append(
+        stream_id=f"loan-{app_id}",
+        aggregate_type="LoanApplication",
+        expected_version=0,
+        events=[
+            ApplicationSubmittedEvent(
+                payload={"application_id": app_id, "requested_amount_usd": 9000}
+            ),
+            CreditAnalysisRequestedEvent(payload={"application_id": app_id}),
+        ],
+    )
+    await server.store.append(
+        stream_id=f"compliance-{app_id}",
+        aggregate_type="ComplianceRecord",
+        expected_version=0,
+        events=[
+            ComplianceCheckRequestedEvent(
+                payload={
+                    "application_id": app_id,
+                    "regulation_set_version": "2026.03",
+                    "checks_required": ["rule-a"],
+                }
+            ),
+            ComplianceRulePassedEvent(
+                payload={
+                    "application_id": app_id,
+                    "rule_id": "rule-a",
+                    "rule_version": "v1",
+                }
+            ),
+        ],
+    )
+    await server.store.append(
+        stream_id=session_stream,
+        aggregate_type="AgentSession",
+        expected_version=0,
+        events=[
+            AgentContextLoadedEvent(
+                payload={
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "model_version": "credit-v2",
+                }
+            ),
+            CreditAnalysisCompletedEvent(
+                payload={
+                    "application_id": app_id,
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "model_version": "credit-v2",
+                    "confidence_score": 0.55,
+                    "recommended_limit_usd": 8000,
+                }
+            ),
+            FraudScreeningCompletedEvent(
+                payload={
+                    "application_id": app_id,
+                    "agent_id": agent_id,
+                    "screening_model_version": "credit-v2",
+                    "fraud_score": 0.12,
+                    "input_data_hash": "hash-fraud-low",
+                    "anomaly_flags": [],
+                }
+            ),
+        ],
+    )
+
+    result = await server.call_tool(
+        "generate_decision",
+        {
+            "application_id": app_id,
+            "orchestrator_agent_id": "orchestrator-low",
+            "recommendation": "APPROVE",
+            "confidence_score": 0.55,
+            "decision_basis_summary": "confidence floor should force refer",
+            "contributing_agent_sessions": [session_stream],
+            "model_versions": {"orchestrator-low": "orch-v1"},
+        },
+    )
+    assert result["ok"] is True
+    assert result["result"]["recommendation"] == "REFER"

@@ -532,7 +532,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 {
                     "application_id": application_id,
                     "applicant_id": request_body.applicant_id,
-                    "requested_amount_usd": 1200000,
+                    "requested_amount_usd": 1300000,
                     "loan_purpose": "import_financing",
                     "submission_channel": "addis-branch",
                     "submitted_at": datetime.now(UTC).isoformat(),
@@ -622,6 +622,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 },
             ),
         ]
+
+        if principal.role in {"compliance", "admin"}:
+            steps.append(
+                (
+                    "run_integrity_check",
+                    {
+                        "entity_type": "application",
+                        "entity_id": application_id,
+                        "role": principal.role,
+                    },
+                )
+            )
 
         executed: list[dict[str, Any]] = []
         for step_name, args in steps:
@@ -966,6 +978,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         lines = [
             "# HELP ledger_projection_events_behind Number of events not yet projected.",
             "# TYPE ledger_projection_events_behind gauge",
+            "# HELP ledger_projection_lag_ms Backlog lag in milliseconds (0 when fully synced).",
+            "# TYPE ledger_projection_lag_ms gauge",
+            "# HELP ledger_projection_checkpoint_age_ms Checkpoint staleness in milliseconds since last projection update.",
+            "# TYPE ledger_projection_checkpoint_age_ms gauge",
         ]
         for name in sorted(lags.keys()):
             lag = lags[name]
@@ -973,6 +989,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 f'ledger_projection_events_behind{{projection="{name}"}} {lag.events_behind}'
             )
             lines.append(f'ledger_projection_lag_ms{{projection="{name}"}} {lag.lag_ms:.2f}')
+            lines.append(
+                f'ledger_projection_checkpoint_age_ms{{projection="{name}"}} {lag.checkpoint_age_ms:.2f}'
+            )
             lines.append(
                 f'ledger_projection_checkpoint{{projection="{name}"}} {lag.checkpoint_position}'
             )
@@ -996,6 +1015,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         name: {
                             "events_behind": lag.events_behind,
                             "lag_ms": lag.lag_ms,
+                            "checkpoint_age_ms": lag.checkpoint_age_ms,
                             "status": lag.status,
                             "checkpoint_position": lag.checkpoint_position,
                             "latest_position": lag.latest_position,

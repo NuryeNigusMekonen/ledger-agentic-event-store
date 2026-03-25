@@ -24,27 +24,36 @@ class LedgerMCPResources:
         return [
             {
                 "uri": "ledger://applications/{id}",
-                "description": "ApplicationSummary projection (current state only).",
+                "description": "Reads current application state from ApplicationSummary projection.",
             },
             {
                 "uri": "ledger://applications/{id}/compliance?as_of={timestamp}",
-                "description": "ComplianceAuditView projection with optional temporal query.",
+                "description": (
+                    "Reads compliance timeline/snapshot from ComplianceAuditView projection; "
+                    "supports temporal as_of query."
+                ),
             },
             {
                 "uri": "ledger://applications/{id}/audit-trail",
-                "description": "AuditLedger stream direct load (justified exception).",
+                "description": (
+                    "Justified exception: reads raw AuditLedger stream directly to provide full "
+                    "immutable audit trail."
+                ),
             },
             {
                 "uri": "ledger://agents/{id}/performance",
-                "description": "AgentPerformance projection (current metrics).",
+                "description": "Reads current agent metrics from AgentPerformance projection.",
             },
             {
                 "uri": "ledger://agents/{id}/sessions/{session_id}",
-                "description": "AgentSession stream direct load (justified exception).",
+                "description": (
+                    "Justified exception: reads raw AgentSession stream directly for full replay/"
+                    "debug context."
+                ),
             },
             {
                 "uri": "ledger://ledger/health",
-                "description": "Projection lag watchdog endpoint.",
+                "description": "Reads per-projection lag/health metrics from checkpoint watchdog.",
             },
         ]
 
@@ -56,6 +65,7 @@ class LedgerMCPResources:
                     "InvalidResourceURI",
                     f"Unsupported resource scheme '{parsed.scheme}'.",
                     "use_ledger_scheme",
+                    context={"uri": uri, "scheme": parsed.scheme},
                 )
 
             if parsed.netloc == "applications":
@@ -69,12 +79,14 @@ class LedgerMCPResources:
                 "UnknownResource",
                 f"Unknown netloc '{parsed.netloc}' in URI.",
                 "use_list_resources",
+                context={"uri": uri, "netloc": parsed.netloc},
             )
         except Exception as exc:  # pragma: no cover - defensive
             return _resource_error(
                 "InternalError",
                 f"Resource read failed: {exc}",
                 "inspect_logs_and_retry",
+                context={"uri": uri, "exception_type": type(exc).__name__},
             )
 
     async def _applications_resource(self, path: str, query: str) -> dict[str, Any]:
@@ -92,6 +104,7 @@ class LedgerMCPResources:
             "UnknownResourcePath",
             f"Unknown applications path '{path}'.",
             "use_supported_applications_paths",
+            context={"path": path},
         )
 
     async def _agents_resource(self, path: str) -> dict[str, Any]:
@@ -104,6 +117,7 @@ class LedgerMCPResources:
             "UnknownResourcePath",
             f"Unknown agents path '{path}'.",
             "use_supported_agents_paths",
+            context={"path": path},
         )
 
     async def _ledger_resource(self, path: str) -> dict[str, Any]:
@@ -112,6 +126,7 @@ class LedgerMCPResources:
                 "UnknownResourcePath",
                 f"Unknown ledger path '{path}'.",
                 "use_ledger_health_resource",
+                context={"path": path},
             )
         lags = await self.daemon.get_all_lags()
         return {
@@ -123,6 +138,7 @@ class LedgerMCPResources:
                         "latest_position": lag.latest_position,
                         "events_behind": lag.events_behind,
                         "lag_ms": lag.lag_ms,
+                        "checkpoint_age_ms": lag.checkpoint_age_ms,
                         "status": lag.status,
                         "updated_at": lag.updated_at.isoformat(),
                     }
@@ -146,6 +162,7 @@ class LedgerMCPResources:
                 "NotFound",
                 f"No projected application summary for '{application_id}'.",
                 "verify_application_exists_or_projection_catchup",
+                context={"application_id": application_id},
             )
         return {"ok": True, "result": dict(row)}
 
@@ -161,6 +178,7 @@ class LedgerMCPResources:
                         "ValidationError",
                         "Invalid as_of timestamp format.",
                         "use_iso_8601_timestamp",
+                        context={"as_of": as_of_values[0], "application_id": application_id},
                     )
                 snapshot = await self.compliance_projection.get_compliance_at(
                     conn,
@@ -192,6 +210,7 @@ class LedgerMCPResources:
                 "NotFound",
                 f"No compliance projection found for '{application_id}'.",
                 "record_compliance_events_then_retry",
+                context={"application_id": application_id},
             )
 
         return {
@@ -257,13 +276,18 @@ def _parse_iso_timestamp(value: str) -> datetime | None:
         return None
 
 
-def _resource_error(error_type: str, message: str, suggested_action: str) -> dict[str, Any]:
+def _resource_error(
+    error_type: str,
+    message: str,
+    suggested_action: str,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "ok": False,
         "error": {
             "error_type": error_type,
             "message": message,
+            "context": context or {},
             "suggested_action": suggested_action,
         },
     }
-
