@@ -30,9 +30,10 @@ class RecordingStore:
         self,
         stream_id: str,
         from_position: int = 1,
+        to_position: int | None = None,
         limit: int | None = None,
     ) -> list[StoredEvent]:
-        _ = (from_position, limit)
+        _ = (from_position, to_position, limit)
         self.load_calls.append(stream_id)
         self.operations.append(("load", stream_id))
         return list(self._streams.get(stream_id, []))
@@ -440,6 +441,110 @@ async def test_generate_decision_emits_request_and_human_review_markers() -> Non
         "HumanReviewRequested",
     ]
     assert result.new_stream_version == 5
+
+
+@pytest.mark.asyncio
+async def test_generate_decision_forces_refer_below_confidence_floor() -> None:
+    application_id = "app-floor-handler"
+    loan_stream = f"loan-{application_id}"
+    compliance_stream = f"compliance-{application_id}"
+    session_stream = "agent-credit-agent-9-session-9"
+
+    store = RecordingStore(
+        streams={
+            loan_stream: [
+                _stored_event(
+                    stream_id=loan_stream,
+                    stream_position=1,
+                    event_type="ApplicationSubmitted",
+                    payload={
+                        "application_id": application_id,
+                        "requested_amount_usd": 12000,
+                    },
+                ),
+                _stored_event(
+                    stream_id=loan_stream,
+                    stream_position=2,
+                    event_type="CreditAnalysisRequested",
+                    payload={"application_id": application_id},
+                ),
+            ],
+            compliance_stream: [
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=1,
+                    event_type="ComplianceCheckRequested",
+                    payload={
+                        "application_id": application_id,
+                        "regulation_set_version": "2026.03",
+                        "checks_required": ["rule-a"],
+                    },
+                ),
+                _stored_event(
+                    stream_id=compliance_stream,
+                    stream_position=2,
+                    event_type="ComplianceRulePassed",
+                    payload={
+                        "application_id": application_id,
+                        "rule_id": "rule-a",
+                        "rule_version": "v1",
+                    },
+                ),
+            ],
+            session_stream: [
+                _stored_event(
+                    stream_id=session_stream,
+                    stream_position=1,
+                    event_type="AgentContextLoaded",
+                    payload={
+                        "agent_id": "credit-agent-9",
+                        "session_id": "session-9",
+                        "context_source": "event-replay",
+                        "event_replay_from_position": 1,
+                        "context_token_count": 1200,
+                        "model_version": "credit-v2",
+                    },
+                ),
+                _stored_event(
+                    stream_id=session_stream,
+                    stream_position=2,
+                    event_type="CreditAnalysisCompleted",
+                    payload={
+                        "application_id": application_id,
+                        "agent_id": "credit-agent-9",
+                        "session_id": "session-9",
+                        "model_version": "credit-v2",
+                        "confidence_score": 0.55,
+                        "risk_tier": "MEDIUM",
+                        "recommended_limit_usd": 9000,
+                        "analysis_duration_ms": 150,
+                        "input_data_hash": "hash-9",
+                    },
+                ),
+            ],
+        }
+    )
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    await handlers.handle_generate_decision(
+        GenerateDecisionCommand(
+            application_id=application_id,
+            orchestrator_agent_id="orchestrator-9",
+            recommendation="APPROVE",
+            confidence_score=0.55,
+            decision_basis_summary="low confidence should force refer",
+            contributing_agent_sessions=[session_stream],
+            model_versions={"orchestrator-9": "orch-v9"},
+            correlation_id="corr-floor-1",
+            causation_id="cause-floor-1",
+        )
+    )
+
+    append_call = store.append_calls[0]
+    decision_event = next(
+        event for event in append_call["events"] if event.event_type == "DecisionGenerated"
+    )
+    assert decision_event.payload.recommendation == "REFER"
 
 
 @pytest.mark.asyncio

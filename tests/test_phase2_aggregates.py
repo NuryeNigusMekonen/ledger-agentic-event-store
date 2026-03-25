@@ -71,7 +71,7 @@ def test_loan_approval_rejected_when_compliance_pending() -> None:
             event_type="DecisionGenerated",
             payload={
                 "application_id": "app-1",
-                "recommendation": "APPROVE",
+                "recommendation": "REFER",
                 "compliance_status": "PENDING",
                 "assessed_max_limit_usd": 700,
                 "contributing_agent_sessions": ["agent-a-s1"],
@@ -145,3 +145,112 @@ def test_compliance_status_moves_to_cleared_when_all_checks_pass() -> None:
         )
     )
     assert aggregate.status == "CLEARED"
+
+
+def test_decision_confidence_floor_forces_refer_in_aggregate() -> None:
+    application_id = "app-floor"
+    loan = LoanApplicationAggregate.replay(
+        [
+            _stored_event(
+                event_type="ApplicationSubmitted",
+                payload={
+                    "application_id": application_id,
+                    "requested_amount_usd": 5000,
+                },
+                stream_id=f"loan-{application_id}",
+                position=1,
+            ),
+            _stored_event(
+                event_type="CreditAnalysisRequested",
+                payload={"application_id": application_id},
+                stream_id=f"loan-{application_id}",
+                position=2,
+            ),
+        ]
+    )
+    contributing_stream = "agent-credit-1-s1"
+    contributing_events = {
+        contributing_stream: [
+            _stored_event(
+                event_type="AgentContextLoaded",
+                payload={
+                    "agent_id": "credit-1",
+                    "session_id": "s1",
+                    "model_version": "credit-v2",
+                },
+                stream_id=contributing_stream,
+                position=1,
+            ),
+            _stored_event(
+                event_type="CreditAnalysisCompleted",
+                payload={
+                    "application_id": application_id,
+                    "agent_id": "credit-1",
+                    "session_id": "s1",
+                    "model_version": "credit-v2",
+                    "confidence_score": 0.55,
+                },
+                stream_id=contributing_stream,
+                position=2,
+            ),
+        ]
+    }
+
+    effective = loan.validate_decision_generation(
+        recommendation="APPROVE",
+        confidence_score=0.55,
+        compliance_status="CLEARED",
+        contributing_agent_sessions=[contributing_stream],
+        contributing_session_events=contributing_events,
+        assessed_max_limit_usd=4000,
+    )
+    assert effective == "REFER"
+
+
+def test_decision_requires_contributing_session_causal_chain() -> None:
+    application_id = "app-causal"
+    loan = LoanApplicationAggregate.replay(
+        [
+            _stored_event(
+                event_type="ApplicationSubmitted",
+                payload={
+                    "application_id": application_id,
+                    "requested_amount_usd": 12000,
+                },
+                stream_id=f"loan-{application_id}",
+                position=1,
+            ),
+            _stored_event(
+                event_type="CreditAnalysisRequested",
+                payload={"application_id": application_id},
+                stream_id=f"loan-{application_id}",
+                position=2,
+            ),
+        ]
+    )
+    contributing_stream = "agent-credit-2-s2"
+
+    with pytest.raises(DomainError):
+        loan.validate_decision_generation(
+            recommendation="REFER",
+            confidence_score=0.82,
+            compliance_status="CLEARED",
+            contributing_agent_sessions=[contributing_stream],
+            contributing_session_events={
+                contributing_stream: [
+                    _stored_event(
+                        event_type="CreditAnalysisCompleted",
+                        payload={
+                            "application_id": application_id,
+                            "agent_id": "credit-2",
+                            "session_id": "s2",
+                            "model_version": "credit-v3",
+                            "confidence_score": 0.82,
+                        },
+                        stream_id=contributing_stream,
+                        position=1,
+                    )
+                ]
+            },
+            assessed_max_limit_usd=10000,
+        )

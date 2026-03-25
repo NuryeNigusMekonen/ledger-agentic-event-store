@@ -89,9 +89,16 @@ class LoanApplicationAggregate:
         self._apply(event.event_type, event.payload, event.metadata)
         self.version = event.stream_position
 
-    def validate_application_approval(self, approved_amount_usd: float) -> None:
-        if self.compliance_status == "PENDING":
-            raise DomainError("Cannot approve application while compliance checks are pending.")
+    def validate_application_approval(
+        self,
+        approved_amount_usd: float,
+        *,
+        compliance_status: str | None = None,
+    ) -> None:
+        effective_compliance_status = (compliance_status or self.compliance_status).upper()
+        if effective_compliance_status != "CLEARED":
+            raise DomainError("Cannot approve application unless compliance is CLEARED.")
+        self.compliance_status = effective_compliance_status
         if (
             self.assessed_max_limit_usd is not None
             and approved_amount_usd > self.assessed_max_limit_usd
@@ -99,6 +106,70 @@ class LoanApplicationAggregate:
             raise DomainError(
                 "Approved amount exceeds assessed maximum limit from agent analysis."
             )
+
+    def validate_decision_generation(
+        self,
+        *,
+        recommendation: str,
+        confidence_score: float,
+        compliance_status: str,
+        contributing_agent_sessions: list[str],
+        contributing_session_events: dict[str, list[StoredEvent]],
+        assessed_max_limit_usd: float | None,
+    ) -> str:
+        self.ensure_exists(self.application_id or "unknown")
+        self.ensure_mutable()
+
+        normalized_recommendation = recommendation.upper()
+        if normalized_recommendation not in {"APPROVE", "DECLINE", "REFER"}:
+            raise DomainError(
+                "DecisionGenerated recommendation must be APPROVE, DECLINE, or REFER."
+            )
+        if not (0.0 <= confidence_score <= 1.0):
+            raise DomainError("confidence_score must be between 0.0 and 1.0.")
+        if confidence_score < 0.6:
+            normalized_recommendation = "REFER"
+
+        normalized_compliance = compliance_status.upper()
+        if normalized_compliance in {"NOT_STARTED", "PENDING"}:
+            raise DomainError("Cannot generate decision while compliance is incomplete.")
+        if normalized_recommendation == "APPROVE":
+            if normalized_compliance != "CLEARED":
+                raise DomainError("Cannot recommend APPROVE when compliance is not CLEARED.")
+            if assessed_max_limit_usd is None:
+                raise DomainError("APPROVE decision requires at least one credit analysis result.")
+
+        self._validate_contributing_sessions(
+            contributing_agent_sessions=contributing_agent_sessions,
+            contributing_session_events=contributing_session_events,
+        )
+        return normalized_recommendation
+
+    def validate_human_review_completion(
+        self,
+        *,
+        final_decision: str,
+        override: bool,
+        override_reason: str | None,
+        approved_amount_usd: float | None,
+        compliance_status: str,
+    ) -> str:
+        self.ensure_exists(self.application_id or "unknown")
+        self.ensure_mutable()
+
+        normalized_decision = final_decision.upper()
+        if normalized_decision not in {"APPROVE", "DECLINE"}:
+            raise DomainError("final_decision must be APPROVE or DECLINE.")
+        if override and not override_reason:
+            raise DomainError("override_reason is required when override=True.")
+        if normalized_decision == "APPROVE":
+            if approved_amount_usd is None:
+                raise DomainError("approved_amount_usd is required for APPROVE decision.")
+            self.validate_application_approval(
+                approved_amount_usd,
+                compliance_status=compliance_status,
+            )
+        return normalized_decision
 
     def _apply(self, event_type: str, payload: dict[str, Any], metadata: dict[str, Any]) -> None:
         if event_type == "ApplicationSubmitted":
@@ -156,6 +227,17 @@ class LoanApplicationAggregate:
             raise DomainError(
                 "DecisionGenerated recommendation must be APPROVE, DECLINE, or REFER."
             )
+        if typed.confidence_score is not None and typed.confidence_score < 0.6:
+            if recommendation != "REFER":
+                raise DomainError(
+                    "DecisionGenerated with confidence_score < 0.6 must use REFER."
+                )
+        if not typed.contributing_agent_sessions:
+            raise DomainError("DecisionGenerated requires contributing_agent_sessions.")
+        if recommendation == "APPROVE":
+            compliance = (typed.compliance_status or self.compliance_status).upper()
+            if compliance != "CLEARED":
+                raise DomainError("DecisionGenerated APPROVE requires compliance_status CLEARED.")
 
         self.decision_recommendation = recommendation
         if typed.compliance_status is not None:
@@ -233,3 +315,42 @@ class LoanApplicationAggregate:
                 f"{event_name} invalid in current state '{self.status.value}'. "
                 f"Allowed: {allowed_states}."
             )
+
+    def _validate_contributing_sessions(
+        self,
+        *,
+        contributing_agent_sessions: list[str],
+        contributing_session_events: dict[str, list[StoredEvent]],
+    ) -> None:
+        if not contributing_agent_sessions:
+            raise DomainError("At least one contributing agent session is required.")
+        if len(set(contributing_agent_sessions)) != len(contributing_agent_sessions):
+            raise DomainError("contributing_agent_sessions must be unique.")
+
+        current_application_id = str(self.application_id or "")
+        for stream_id in contributing_agent_sessions:
+            events = contributing_session_events.get(stream_id, [])
+            if not events:
+                raise DomainError(
+                    f"Contributing session '{stream_id}' does not exist or has no events."
+                )
+
+            has_context_loaded = any(
+                event.event_type == "AgentContextLoaded"
+                for event in events
+            )
+            if not has_context_loaded:
+                raise DomainError(
+                    f"Contributing session '{stream_id}' is missing AgentContextLoaded."
+                )
+
+            has_relevant_output = any(
+                event.event_type in {"CreditAnalysisCompleted", "FraudScreeningCompleted"}
+                and str(event.payload.get("application_id", "")) == current_application_id
+                for event in events
+            )
+            if not has_relevant_output:
+                raise DomainError(
+                    f"Contributing session '{stream_id}' has no analysis output for "
+                    f"application '{current_application_id}'."
+                )

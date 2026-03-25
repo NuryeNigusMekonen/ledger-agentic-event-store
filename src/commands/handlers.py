@@ -8,7 +8,7 @@ from uuid import uuid4
 from src.aggregates.agent_session import AgentSessionAggregate
 from src.aggregates.audit_ledger import AuditLedgerAggregate
 from src.aggregates.compliance_record import ComplianceRecordAggregate
-from src.aggregates.loan_application import LoanApplicationAggregate, LoanStatus
+from src.aggregates.loan_application import LoanApplicationAggregate
 from src.event_store import EventStore
 from src.models.events import (
     AgentContextLoadedEvent,
@@ -28,6 +28,10 @@ from src.models.events import (
     CreditAnalysisRequestedEvent,
     DecisionGeneratedEvent,
     DecisionRequestedEvent,
+    DocumentAddedEvent,
+    DocumentFormatValidatedEvent,
+    ExtractionCompletedEvent,
+    ExtractionStartedEvent,
     DocumentUploadedEvent,
     DocumentUploadRequestedEvent,
     DomainError,
@@ -35,6 +39,9 @@ from src.models.events import (
     FraudScreeningRequestedEvent,
     HumanReviewCompletedEvent,
     HumanReviewRequestedEvent,
+    PackageCreatedEvent,
+    PackageReadyForAnalysisEvent,
+    QualityAssessmentCompletedEvent,
     StoredEvent,
 )
 from src.refinery.pipeline import extract_financial_facts
@@ -377,8 +384,7 @@ class WriteCommandHandlers:
         events: list[BaseEvent] = []
         if current_version == 0:
             events.append(
-                BaseEvent(
-                    event_type="PackageCreated",
+                PackageCreatedEvent(
                     payload={
                         "application_id": application_id,
                         "package_id": application_id,
@@ -389,8 +395,7 @@ class WriteCommandHandlers:
             )
         events.extend(
             [
-                BaseEvent(
-                    event_type="DocumentAdded",
+                DocumentAddedEvent(
                     payload={
                         "application_id": application_id,
                         "document_path": document_path,
@@ -399,8 +404,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 ),
-                BaseEvent(
-                    event_type="DocumentFormatValidated",
+                DocumentFormatValidatedEvent(
                     payload={
                         "application_id": application_id,
                         "document_path": document_path,
@@ -409,8 +413,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 ),
-                BaseEvent(
-                    event_type="ExtractionStarted",
+                ExtractionStartedEvent(
                     payload={
                         "application_id": application_id,
                         "document_path": document_path,
@@ -419,8 +422,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 ),
-                BaseEvent(
-                    event_type="ExtractionCompleted",
+                ExtractionCompletedEvent(
                     payload={
                         "application_id": application_id,
                         "document_path": document_path,
@@ -431,8 +433,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 ),
-                BaseEvent(
-                    event_type="QualityAssessmentCompleted",
+                QualityAssessmentCompletedEvent(
                     payload={
                         "application_id": application_id,
                         "overall_confidence": round(overall_confidence, 3),
@@ -444,8 +445,7 @@ class WriteCommandHandlers:
                     },
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 ),
-                BaseEvent(
-                    event_type="PackageReadyForAnalysis",
+                PackageReadyForAnalysisEvent(
                     payload={
                         "application_id": application_id,
                         "package_id": application_id,
@@ -792,30 +792,25 @@ class WriteCommandHandlers:
         compliance_stream_id = _compliance_stream_id(command.application_id)
         compliance = await ComplianceRecordAggregate.load(self.store, compliance_stream_id)
 
-        contributing_events = await self._load_contributing_agent_events(
+        contributing_session_events = await self._load_contributing_agent_events(
             command.contributing_agent_sessions
         )
+        contributing_events = [
+            event
+            for stream_events in contributing_session_events.values()
+            for event in stream_events
+        ]
+        assessed_max_limit = _extract_assessed_max_limit(contributing_events)
 
         # 2) Validate
-        if loan.status == LoanStatus.EMPTY:
-            raise DomainError(f"Loan application '{command.application_id}' does not exist.")
-        loan.ensure_mutable()
-        if not contributing_events:
-            raise DomainError("At least one contributing agent session is required.")
-        if compliance.status == "NOT_STARTED":
-            raise DomainError("Compliance stream not initialized for this application.")
-        if compliance.is_pending:
-            raise DomainError("Cannot generate decision while compliance is pending.")
-
-        recommendation = command.recommendation.upper()
-        if recommendation == "APPROVE" and not compliance.is_cleared:
-            raise DomainError("Cannot recommend APPROVE when compliance is not CLEARED.")
-        if not (0.0 <= command.confidence_score <= 1.0):
-            raise DomainError("confidence_score must be between 0.0 and 1.0.")
-
-        assessed_max_limit = _extract_assessed_max_limit(contributing_events)
-        if recommendation == "APPROVE" and assessed_max_limit is None:
-            raise DomainError("APPROVE decision requires at least one credit analysis result.")
+        recommendation = loan.validate_decision_generation(
+            recommendation=command.recommendation,
+            confidence_score=command.confidence_score,
+            compliance_status=compliance.status,
+            contributing_agent_sessions=command.contributing_agent_sessions,
+            contributing_session_events=contributing_session_events,
+            assessed_max_limit_usd=assessed_max_limit,
+        )
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
@@ -894,14 +889,13 @@ class WriteCommandHandlers:
         compliance = await ComplianceRecordAggregate.load(self.store, compliance_stream_id)
 
         # 2) Validate
-        if loan.status == LoanStatus.EMPTY:
-            raise DomainError(f"Loan application '{command.application_id}' does not exist.")
-        loan.ensure_mutable()
-        final_decision = command.final_decision.upper()
-        if final_decision not in {"APPROVE", "DECLINE"}:
-            raise DomainError("final_decision must be APPROVE or DECLINE.")
-        if command.override and not command.override_reason:
-            raise DomainError("override_reason is required when override=True.")
+        final_decision = loan.validate_human_review_completion(
+            final_decision=command.final_decision,
+            override=command.override,
+            override_reason=command.override_reason,
+            approved_amount_usd=command.approved_amount_usd,
+            compliance_status=compliance.status,
+        )
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
@@ -924,10 +918,6 @@ class WriteCommandHandlers:
         ]
 
         if final_decision == "APPROVE":
-            if command.approved_amount_usd is None:
-                raise DomainError("approved_amount_usd is required for APPROVE decision.")
-            loan.compliance_status = compliance.status
-            loan.validate_application_approval(command.approved_amount_usd)
             decided_events.append(
                 ApplicationApprovedEvent(
                     payload={
@@ -1023,12 +1013,12 @@ class WriteCommandHandlers:
     async def _load_contributing_agent_events(
         self,
         contributing_agent_sessions: list[str],
-    ) -> list[StoredEvent]:
-        events: list[StoredEvent] = []
+    ) -> dict[str, list[StoredEvent]]:
+        events_by_stream: dict[str, list[StoredEvent]] = {}
         for stream_id in contributing_agent_sessions:
             stream_events = await self.store.load_stream(stream_id)
-            events.extend(stream_events)
-        return events
+            events_by_stream[stream_id] = stream_events
+        return events_by_stream
 
 
 def _loan_stream_id(application_id: str) -> str:
