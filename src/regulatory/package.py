@@ -146,6 +146,7 @@ async def _integrity_result_as_of(
     )
     return {
         "chain_valid": result.chain_valid,
+        "tamper_detected": result.tamper_detected,
         "events_verified_count": result.events_verified_count,
         "final_hash": result.final_hash,
         "violations": [

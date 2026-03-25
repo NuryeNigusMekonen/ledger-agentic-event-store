@@ -29,6 +29,6 @@ class ProjectionLag:
     latest_position: int
     events_behind: int
     lag_ms: float
+    checkpoint_age_ms: float
     status: str
     updated_at: datetime
-

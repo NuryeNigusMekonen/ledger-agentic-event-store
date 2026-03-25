@@ -5,11 +5,22 @@ from typing import Any
 
 import asyncpg
 
+from src.event_store import EventStore
 from src.models.events import StoredEvent
 
 
 class ComplianceAuditViewProjection:
     name = "compliance_audit_view"
+    state_table = "compliance_audit_state_projection"
+    view_table = "compliance_audit_view_projection"
+    state_shadow_table = "compliance_audit_state_projection_rebuild"
+    view_shadow_table = "compliance_audit_view_projection_rebuild"
+    subscribed_event_types = {
+        "ComplianceCheckRequested",
+        "ComplianceRulePassed",
+        "ComplianceRuleFailed",
+        "ComplianceCheckCompleted",
+    }
 
     async def ensure_schema(self, conn: asyncpg.Connection) -> None:
         await conn.execute(
@@ -46,16 +57,119 @@ class ComplianceAuditViewProjection:
         )
 
     async def reset(self, conn: asyncpg.Connection) -> None:
-        await conn.execute("TRUNCATE TABLE compliance_audit_view_projection")
-        await conn.execute("TRUNCATE TABLE compliance_audit_state_projection")
+        await conn.execute(f"TRUNCATE TABLE {self.view_table}")
+        await conn.execute(f"TRUNCATE TABLE {self.state_table}")
 
     async def apply(self, conn: asyncpg.Connection, event: StoredEvent) -> None:
-        if event.event_type not in {
-            "ComplianceCheckRequested",
-            "ComplianceRulePassed",
-            "ComplianceRuleFailed",
-            "ComplianceCheckCompleted",
-        }:
+        await self._apply_to_tables(
+            conn=conn,
+            event=event,
+            state_table=self.state_table,
+            view_table=self.view_table,
+        )
+
+    async def rebuild_from_scratch(
+        self,
+        store: EventStore,
+        batch_size: int = 500,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0.")
+
+        async with store._pool.acquire() as conn:
+            await self.ensure_schema(conn)
+            await self._ensure_shadow_schema(conn)
+            await conn.execute(f"TRUNCATE TABLE {self.view_shadow_table}")
+            await conn.execute(f"TRUNCATE TABLE {self.state_shadow_table}")
+            replay_until = int(
+                await conn.fetchval("SELECT COALESCE(MAX(global_position), 0) FROM events")
+                or 0
+            )
+
+        processed = 0
+        stop_replay = False
+        async for batch in store.load_all(
+            from_global_position=0,
+            batch_size=batch_size,
+            event_types=self.subscribed_event_types,
+        ):
+            if stop_replay:
+                break
+            async with store._pool.acquire() as conn:
+                async with conn.transaction():
+                    for event in batch:
+                        if event.global_position > replay_until:
+                            stop_replay = True
+                            break
+                        await self._apply_to_tables(
+                            conn=conn,
+                            event=event,
+                            state_table=self.state_shadow_table,
+                            view_table=self.view_shadow_table,
+                        )
+                        processed += 1
+
+        async with store._pool.acquire() as conn:
+            async with conn.transaction():
+                old_state_table = f"{self.state_table}_old"
+                old_view_table = f"{self.view_table}_old"
+                await conn.execute(f"DROP TABLE IF EXISTS {old_view_table}")
+                await conn.execute(f"DROP TABLE IF EXISTS {old_state_table}")
+                await conn.execute(f"ALTER TABLE {self.view_table} RENAME TO {old_view_table}")
+                await conn.execute(f"ALTER TABLE {self.state_table} RENAME TO {old_state_table}")
+                await conn.execute(f"ALTER TABLE {self.view_shadow_table} RENAME TO {self.view_table}")
+                await conn.execute(f"ALTER TABLE {self.state_shadow_table} RENAME TO {self.state_table}")
+                await conn.execute(f"DROP TABLE IF EXISTS {old_view_table}")
+                await conn.execute(f"DROP TABLE IF EXISTS {old_state_table}")
+                await conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_compliance_view_recorded
+                      ON compliance_audit_view_projection (application_id, recorded_at DESC)
+                    """
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO projection_checkpoints (
+                      projection_name,
+                      last_global_position,
+                      last_event_at,
+                      updated_at,
+                      metadata
+                    )
+                    VALUES (
+                      $1,
+                      $2,
+                      NOW(),
+                      NOW(),
+                      jsonb_build_object(
+                        'snapshot_strategy', 'state+timeline',
+                        'last_rebuild_at', NOW()::text
+                      )
+                    )
+                    ON CONFLICT (projection_name)
+                    DO UPDATE SET
+                      last_global_position = EXCLUDED.last_global_position,
+                      last_event_at = EXCLUDED.last_event_at,
+                      updated_at = NOW(),
+                      metadata = projection_checkpoints.metadata
+                        || jsonb_build_object(
+                          'snapshot_strategy', 'state+timeline',
+                          'last_rebuild_at', NOW()::text
+                        )
+                    """,
+                    self.name,
+                    replay_until,
+                )
+        return processed
+
+    async def _apply_to_tables(
+        self,
+        conn: asyncpg.Connection,
+        event: StoredEvent,
+        state_table: str,
+        view_table: str,
+    ) -> None:
+        if event.event_type not in self.subscribed_event_types:
             return
 
         payload = event.payload
@@ -63,12 +177,12 @@ class ComplianceAuditViewProjection:
         if not application_id:
             return
 
-        state = await self._load_state(conn, application_id)
+        state = await self._load_state(conn, application_id, state_table=state_table)
         updated_state = _next_state(state, event)
 
         await conn.execute(
-            """
-            INSERT INTO compliance_audit_state_projection (
+            f"""
+            INSERT INTO {state_table} (
               application_id,
               regulation_set_version,
               mandatory_checks,
@@ -99,8 +213,8 @@ class ComplianceAuditViewProjection:
         )
 
         await conn.execute(
-            """
-            INSERT INTO compliance_audit_view_projection (
+            f"""
+            INSERT INTO {view_table} (
               application_id,
               global_position,
               recorded_at,
@@ -129,6 +243,37 @@ class ComplianceAuditViewProjection:
             event.metadata,
         )
 
+    async def _ensure_shadow_schema(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.state_shadow_table} (
+              application_id TEXT PRIMARY KEY,
+              regulation_set_version TEXT,
+              mandatory_checks JSONB NOT NULL DEFAULT '[]'::jsonb,
+              passed_checks JSONB NOT NULL DEFAULT '[]'::jsonb,
+              failed_checks JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+              compliance_status TEXT NOT NULL DEFAULT 'NOT_STARTED',
+              last_global_position BIGINT NOT NULL DEFAULT 0,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS {self.view_shadow_table} (
+              application_id TEXT NOT NULL,
+              global_position BIGINT NOT NULL,
+              recorded_at TIMESTAMPTZ NOT NULL,
+              event_type TEXT NOT NULL,
+              compliance_status TEXT NOT NULL,
+              regulation_set_version TEXT,
+              rule_id TEXT,
+              rule_version TEXT,
+              failure_reason TEXT,
+              payload JSONB NOT NULL,
+              metadata JSONB NOT NULL,
+              PRIMARY KEY (application_id, global_position)
+            );
+            """
+        )
+
     async def get_compliance_at(
         self,
         conn: asyncpg.Connection,
@@ -136,7 +281,7 @@ class ComplianceAuditViewProjection:
         as_of: datetime,
     ) -> dict[str, Any] | None:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT
               application_id,
               global_position,
@@ -149,7 +294,7 @@ class ComplianceAuditViewProjection:
               failure_reason,
               payload,
               metadata
-            FROM compliance_audit_view_projection
+            FROM {self.view_table}
             WHERE application_id = $1 AND recorded_at <= $2
             ORDER BY recorded_at DESC, global_position DESC
             LIMIT 1
@@ -167,7 +312,7 @@ class ComplianceAuditViewProjection:
         application_id: str,
     ) -> dict[str, Any] | None:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT
               application_id,
               regulation_set_version,
@@ -177,7 +322,7 @@ class ComplianceAuditViewProjection:
               compliance_status,
               last_global_position,
               updated_at
-            FROM compliance_audit_state_projection
+            FROM {self.state_table}
             WHERE application_id = $1
             """,
             application_id,
@@ -186,16 +331,21 @@ class ComplianceAuditViewProjection:
             return None
         return dict(row)
 
-    async def _load_state(self, conn: asyncpg.Connection, application_id: str) -> dict[str, Any]:
+    async def _load_state(
+        self,
+        conn: asyncpg.Connection,
+        application_id: str,
+        state_table: str,
+    ) -> dict[str, Any]:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT
               regulation_set_version,
               mandatory_checks,
               passed_checks,
               failed_checks,
               compliance_status
-            FROM compliance_audit_state_projection
+            FROM {state_table}
             WHERE application_id = $1
             """,
             application_id,
