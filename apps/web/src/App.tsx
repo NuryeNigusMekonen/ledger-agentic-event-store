@@ -5,10 +5,10 @@ import {
   clearStoredToken,
   fetchAgentPerformance,
   fetchAgentSession,
+  fetchAllApplications,
   fetchApplication,
   fetchApplicationAuditTrail,
   fetchApplicationEvents,
-  fetchApplications,
   fetchResources,
   fetchApplicationStates,
   fetchAuthAudit,
@@ -1595,6 +1595,7 @@ export default function App() {
 
   const [states, setStates] = useState<AppStateCount[]>([]);
   const [applications, setApplications] = useState<ApplicationSummary[]>([]);
+  const [trackedApplicationsTotal, setTrackedApplicationsTotal] = useState<number>(0);
   const [application, setApplication] = useState<ApplicationSummary | null>(null);
   const [compliance, setCompliance] = useState<ComplianceView | null>(null);
   const [temporalCompliance, setTemporalCompliance] = useState<ComplianceView | null>(null);
@@ -2053,6 +2054,7 @@ export default function App() {
     setLastIntegrityCheckResult(null);
     setAuditRows([]);
     setApplicationEvents([]);
+    setTrackedApplicationsTotal(0);
     setIntegrityTrail([]);
     setTemporalCompliance(null);
     setSessionReplay(null);
@@ -2139,9 +2141,9 @@ export default function App() {
   );
 
   const refreshGlobal = useCallback(async () => {
-    const [nextStates, nextApps, nextHealth, nextEvents, nextTools, nextResources] = await Promise.all([
+    const [nextStates, nextAppsPage, nextHealth, nextEvents, nextTools, nextResources] = await Promise.all([
       fetchApplicationStates(),
-      fetchApplications(40),
+      fetchAllApplications(200),
       fetchLedgerHealth(),
       fetchRecentEvents(60),
       fetchTools(),
@@ -2149,7 +2151,8 @@ export default function App() {
     ]);
 
     setStates(nextStates);
-    setApplications(nextApps);
+    setApplications(nextAppsPage.items);
+    setTrackedApplicationsTotal(nextAppsPage.total);
     setHealth(nextHealth);
     setRecentEvents(nextEvents);
     setToolDefinitions(nextTools);
@@ -2765,7 +2768,7 @@ export default function App() {
         <section className="metric-strip">
           <MetricTile
             label="Tracked Applications"
-            value={`${applications.length}`}
+            value={`${trackedApplicationsTotal}`}
             detail="Governed in event store"
             tone="neutral"
           />
@@ -3022,7 +3025,9 @@ export default function App() {
                       <p className="section-kicker">Tracked Pipeline</p>
                       <h2>Application register</h2>
                     </div>
-                    <p className="section-note">{visibleApplicationRows.length} rows in view</p>
+                    <p className="section-note">
+                      {visibleApplicationRows.length} rows in view of {trackedApplicationsTotal}
+                    </p>
                   </div>
 
                   <div className="application-list">

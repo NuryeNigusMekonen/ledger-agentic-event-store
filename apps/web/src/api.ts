@@ -62,6 +62,14 @@ export type AuthAuditRow = {
   created_at: string;
 };
 
+export type ApplicationsPage = {
+  items: ApplicationSummary[];
+  count: number;
+  total: number;
+  limit: number;
+  offset: number;
+};
+
 function readStoredToken(): string | null {
   return localStorage.getItem(TOKEN_STORAGE_KEY);
 }
@@ -314,4 +322,42 @@ export async function fetchRecentEvents(limit = 20): Promise<RecentEvent[]> {
 export async function fetchApplications(limit = 20): Promise<ApplicationSummary[]> {
   const result = await apiRequest<{ items: ApplicationSummary[] }>(`/applications?limit=${limit}`);
   return result.items;
+}
+
+export async function fetchApplicationsPage(limit = 100, offset = 0): Promise<ApplicationsPage> {
+  const clampedLimit = Math.min(Math.max(1, Math.floor(limit)), 200);
+  const safeOffset = Math.max(0, Math.floor(offset));
+  return await apiRequest<ApplicationsPage>(
+    `/applications?limit=${clampedLimit}&offset=${safeOffset}`
+  );
+}
+
+export async function fetchAllApplications(pageSize = 200): Promise<ApplicationsPage> {
+  const clampedPageSize = Math.min(Math.max(1, Math.floor(pageSize)), 200);
+  const allItems: ApplicationSummary[] = [];
+  let total = 0;
+  let offset = 0;
+
+  while (true) {
+    const page = await fetchApplicationsPage(clampedPageSize, offset);
+    total = page.total;
+    if (page.items.length === 0) {
+      break;
+    }
+
+    allItems.push(...page.items);
+    offset += page.items.length;
+
+    if (offset >= total) {
+      break;
+    }
+  }
+
+  return {
+    items: allItems,
+    count: allItems.length,
+    total,
+    limit: clampedPageSize,
+    offset: 0
+  };
 }
