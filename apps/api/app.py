@@ -861,6 +861,93 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         result = await app.state.mcp.read_resource("ledger://ledger/health")
         return _resource_response(result)
 
+    @app.get("/api/v1/ledger/delivery")
+    async def ledger_delivery() -> JSONResponse:
+        snapshot = await _read_outbox_delivery_snapshot(
+            store=app.state.store,
+            settings=app.state.settings,
+        )
+        return _json_response(status_code=200, content={"ok": True, "result": snapshot})
+
+    @app.get("/api/v1/analytics/summary")
+    async def analytics_summary(
+        window_days: int = Query(default=30, ge=7, le=90),
+    ) -> JSONResponse:
+        if window_days not in {7, 30, 90}:
+            return _json_response(
+                status_code=422,
+                content=_error_payload(
+                    error_type="ValidationError",
+                    message="window_days must be one of: 7, 30, 90.",
+                    suggested_action="use_window_days_7_30_or_90",
+                ),
+            )
+        snapshot = await _read_client_analytics_summary(
+            store=app.state.store,
+            window_days=window_days,
+        )
+        return _json_response(status_code=200, content={"ok": True, "result": snapshot})
+
+    @app.get("/api/v1/metrics/summary")
+    async def metrics_summary(
+        window_days: int = Query(default=30, ge=7, le=90),
+    ) -> JSONResponse:
+        if window_days not in {7, 30, 90}:
+            return _json_response(
+                status_code=422,
+                content=_error_payload(
+                    error_type="ValidationError",
+                    message="window_days must be one of: 7, 30, 90.",
+                    suggested_action="use_window_days_7_30_or_90",
+                ),
+            )
+
+        summary = await _read_projection_metrics_summary(
+            store=app.state.store,
+            window_days=window_days,
+        )
+        return _json_response(status_code=200, content={"ok": True, "result": summary})
+
+    @app.get("/api/v1/metrics/daily")
+    async def metrics_daily(
+        window_days: int = Query(default=30, ge=7, le=90),
+    ) -> JSONResponse:
+        if window_days not in {7, 30, 90}:
+            return _json_response(
+                status_code=422,
+                content=_error_payload(
+                    error_type="ValidationError",
+                    message="window_days must be one of: 7, 30, 90.",
+                    suggested_action="use_window_days_7_30_or_90",
+                ),
+            )
+
+        rows = await _read_projection_metrics_daily(
+            store=app.state.store,
+            window_days=window_days,
+        )
+        return _json_response(status_code=200, content={"ok": True, "result": rows})
+
+    @app.get("/api/v1/metrics/agents")
+    async def metrics_agents(
+        window_days: int = Query(default=30, ge=7, le=90),
+    ) -> JSONResponse:
+        if window_days not in {7, 30, 90}:
+            return _json_response(
+                status_code=422,
+                content=_error_payload(
+                    error_type="ValidationError",
+                    message="window_days must be one of: 7, 30, 90.",
+                    suggested_action="use_window_days_7_30_or_90",
+                ),
+            )
+
+        rows = await _read_projection_metrics_agents(
+            store=app.state.store,
+            window_days=window_days,
+        )
+        return _json_response(status_code=200, content={"ok": True, "result": rows})
+
     @app.post("/api/v1/projections/rebuild")
     async def rebuild_projection(
         request: Request,
@@ -975,13 +1062,31 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.get("/api/v1/metrics")
     async def metrics() -> PlainTextResponse:
         lags = await app.state.mcp.daemon.get_all_lags()
+        delivery = await _read_outbox_delivery_snapshot(
+            store=app.state.store,
+            settings=app.state.settings,
+        )
         lines = [
             "# HELP ledger_projection_events_behind Number of events not yet projected.",
             "# TYPE ledger_projection_events_behind gauge",
             "# HELP ledger_projection_lag_ms Backlog lag in milliseconds (0 when fully synced).",
             "# TYPE ledger_projection_lag_ms gauge",
-            "# HELP ledger_projection_checkpoint_age_ms Checkpoint staleness in milliseconds since last projection update.",
+            "# HELP ledger_projection_checkpoint_age_ms "
+            "Checkpoint staleness in milliseconds since last projection update.",
             "# TYPE ledger_projection_checkpoint_age_ms gauge",
+            "# HELP ledger_outbox_pending Number of pending outbox messages.",
+            "# TYPE ledger_outbox_pending gauge",
+            "# HELP ledger_outbox_retrying Number of pending outbox messages with retries.",
+            "# TYPE ledger_outbox_retrying gauge",
+            "# HELP ledger_outbox_dead_letter Number of dead-lettered outbox messages.",
+            "# TYPE ledger_outbox_dead_letter gauge",
+            "# HELP ledger_outbox_published_total Total number of published outbox messages.",
+            "# TYPE ledger_outbox_published_total gauge",
+            "# HELP ledger_outbox_published_last_5m "
+            "Outbox messages published in the last five minutes.",
+            "# TYPE ledger_outbox_published_last_5m gauge",
+            "# HELP ledger_outbox_published_last_1h Outbox messages published in the last hour.",
+            "# TYPE ledger_outbox_published_last_1h gauge",
         ]
         for name in sorted(lags.keys()):
             lag = lags[name]
@@ -990,12 +1095,23 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             )
             lines.append(f'ledger_projection_lag_ms{{projection="{name}"}} {lag.lag_ms:.2f}')
             lines.append(
-                f'ledger_projection_checkpoint_age_ms{{projection="{name}"}} {lag.checkpoint_age_ms:.2f}'
+                f'ledger_projection_checkpoint_age_ms{{projection="{name}"}} '
+                f"{lag.checkpoint_age_ms:.2f}"
             )
             lines.append(
                 f'ledger_projection_checkpoint{{projection="{name}"}} {lag.checkpoint_position}'
             )
             lines.append(f'ledger_projection_latest{{projection="{name}"}} {lag.latest_position}')
+        lines.append(f"ledger_outbox_pending {delivery['outbox']['pending']}")
+        lines.append(f"ledger_outbox_retrying {delivery['outbox']['retrying']}")
+        lines.append(f"ledger_outbox_dead_letter {delivery['outbox']['dead_letter']}")
+        lines.append(f"ledger_outbox_published_total {delivery['outbox']['published_total']}")
+        lines.append(
+            f"ledger_outbox_published_last_5m {delivery['throughput']['published_last_5m']}"
+        )
+        lines.append(
+            f"ledger_outbox_published_last_1h {delivery['throughput']['published_last_1h']}"
+        )
         return PlainTextResponse("\n".join(lines) + "\n")
 
     @app.get("/api/v1/stream/lag")
@@ -1029,6 +1145,747 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return app
+
+
+async def _read_outbox_delivery_snapshot(
+    *,
+    store: EventStore,
+    settings: AppSettings,
+) -> dict[str, Any]:
+    async with store._pool.acquire() as conn:
+        summary = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+              COUNT(*) FILTER (WHERE status = 'pending' AND attempts > 0) AS retrying_count,
+              COUNT(*) FILTER (WHERE status = 'dead_letter') AS dead_letter_count,
+              COUNT(*) FILTER (WHERE status = 'published') AS published_count,
+              COUNT(*) FILTER (
+                WHERE status = 'pending' AND next_attempt_at <= NOW()
+              ) AS due_now_count,
+              COALESCE(AVG(attempts) FILTER (WHERE status = 'pending'), 0) AS pending_avg_attempts,
+              COUNT(*) FILTER (
+                WHERE status = 'published' AND published_at >= NOW() - INTERVAL '5 minutes'
+              ) AS published_last_5m,
+              COUNT(*) FILTER (
+                WHERE status = 'published' AND published_at >= NOW() - INTERVAL '1 hour'
+              ) AS published_last_1h,
+              MAX(published_at) AS last_published_at,
+              MIN(created_at) FILTER (WHERE status = 'pending') AS oldest_pending_created_at
+            FROM outbox
+            """
+        )
+        topic_rows = await conn.fetch(
+            """
+            SELECT
+              topic,
+              COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+              COUNT(*) FILTER (WHERE status = 'dead_letter') AS dead_letter_count,
+              COUNT(*) FILTER (
+                WHERE status = 'published' AND published_at >= NOW() - INTERVAL '1 hour'
+              ) AS published_last_1h
+            FROM outbox
+            GROUP BY topic
+            ORDER BY pending_count DESC, dead_letter_count DESC, topic ASC
+            LIMIT 8
+            """
+        )
+
+    now = datetime.now(UTC)
+    pending = int(summary["pending_count"] or 0)
+    retrying = int(summary["retrying_count"] or 0)
+    dead_letter = int(summary["dead_letter_count"] or 0)
+    published_total = int(summary["published_count"] or 0)
+    due_now = int(summary["due_now_count"] or 0)
+    published_last_5m = int(summary["published_last_5m"] or 0)
+    published_last_1h = int(summary["published_last_1h"] or 0)
+    pending_avg_attempts = float(summary["pending_avg_attempts"] or 0.0)
+    last_published_at = summary["last_published_at"]
+    oldest_pending_created_at = summary["oldest_pending_created_at"]
+
+    oldest_pending_age_ms: float | None = None
+    if oldest_pending_created_at is not None:
+        oldest_pending_age_ms = max(
+            0.0,
+            (now - oldest_pending_created_at).total_seconds() * 1000,
+        )
+
+    if dead_letter > 0:
+        delivery_status = "critical"
+    elif pending > 0 or retrying > 0:
+        delivery_status = "warning"
+    else:
+        delivery_status = "healthy"
+
+    publisher_mode = (settings.outbox_publisher or "sink").strip().lower()
+    kafka_bootstrap = settings.kafka_bootstrap_servers
+    if publisher_mode == "kafka":
+        if kafka_bootstrap:
+            transport_status = "configured"
+            transport_detail = f"Kafka configured on {kafka_bootstrap}."
+        else:
+            transport_status = "misconfigured"
+            transport_detail = "Kafka mode selected but KAFKA_BOOTSTRAP_SERVERS is missing."
+    elif publisher_mode == "sink":
+        transport_status = "local_validation"
+        transport_detail = "Using local PostgreSQL sink publisher."
+    else:
+        transport_status = "custom"
+        transport_detail = f"Using custom publisher mode '{publisher_mode}'."
+
+    return {
+        "status": delivery_status,
+        "transport": {
+            "mode": publisher_mode,
+            "status": transport_status,
+            "detail": transport_detail,
+            "broker": kafka_bootstrap if publisher_mode == "kafka" else None,
+        },
+        "outbox": {
+            "pending": pending,
+            "retrying": retrying,
+            "dead_letter": dead_letter,
+            "published_total": published_total,
+            "due_now": due_now,
+            "pending_avg_attempts": round(pending_avg_attempts, 2),
+            "oldest_pending_age_ms": oldest_pending_age_ms,
+            "last_published_at": (
+                last_published_at.isoformat() if last_published_at is not None else None
+            ),
+        },
+        "throughput": {
+            "published_last_5m": published_last_5m,
+            "published_last_1h": published_last_1h,
+        },
+        "topics": [
+            {
+                "topic": str(row["topic"]),
+                "pending": int(row["pending_count"] or 0),
+                "dead_letter": int(row["dead_letter_count"] or 0),
+                "published_last_1h": int(row["published_last_1h"] or 0),
+            }
+            for row in topic_rows
+        ],
+        "updated_at": now.isoformat(),
+    }
+
+
+async def _read_client_analytics_summary(
+    *,
+    store: EventStore,
+    window_days: int = 30,
+) -> dict[str, Any]:
+    effective_window_days = window_days if window_days in {7, 30, 90} else 30
+
+    async with store._pool.acquire() as conn:
+        trend_rows = await conn.fetch(
+            """
+            WITH days AS (
+              SELECT generate_series(
+                date_trunc('day', NOW() - (($1::int - 1) * INTERVAL '1 day')),
+                date_trunc('day', NOW()),
+                INTERVAL '1 day'
+              )::date AS day
+            ),
+            submitted AS (
+              SELECT date_trunc('day', recorded_at)::date AS day, COUNT(*) AS total
+              FROM events
+              WHERE event_type = 'ApplicationSubmitted'
+                AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              GROUP BY 1
+            ),
+            approved AS (
+              SELECT date_trunc('day', recorded_at)::date AS day, COUNT(*) AS total
+              FROM events
+              WHERE event_type = 'ApplicationApproved'
+                AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              GROUP BY 1
+            ),
+            declined AS (
+              SELECT date_trunc('day', recorded_at)::date AS day, COUNT(*) AS total
+              FROM events
+              WHERE event_type = 'ApplicationDeclined'
+                AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              GROUP BY 1
+            )
+            SELECT
+              d.day,
+              COALESCE(s.total, 0) AS submitted,
+              COALESCE(a.total, 0) AS approved,
+              COALESCE(k.total, 0) AS declined
+            FROM days AS d
+            LEFT JOIN submitted AS s ON s.day = d.day
+            LEFT JOIN approved AS a ON a.day = d.day
+            LEFT JOIN declined AS k ON k.day = d.day
+            ORDER BY d.day ASC
+            """,
+            effective_window_days,
+        )
+
+        kpi_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE event_type = 'ApplicationSubmitted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS submitted,
+              COUNT(*) FILTER (
+                WHERE event_type = 'ApplicationApproved'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS approved,
+              COUNT(*) FILTER (
+                WHERE event_type = 'ApplicationDeclined'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS declined,
+              COALESCE(SUM(
+                CASE
+                  WHEN event_type = 'ApplicationSubmitted'
+                    AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  THEN NULLIF(payload ->> 'requested_amount_usd', '')::double precision
+                  ELSE 0
+                END
+              ), 0) AS requested_volume,
+              COALESCE(SUM(
+                CASE
+                  WHEN event_type = 'ApplicationApproved'
+                    AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  THEN NULLIF(payload ->> 'approved_amount_usd', '')::double precision
+                  ELSE 0
+                END
+              ), 0) AS approved_volume
+            FROM events
+            """,
+            effective_window_days,
+        )
+
+        turnaround_row = await conn.fetchrow(
+            """
+            WITH submissions AS (
+              SELECT
+                payload ->> 'application_id' AS application_id,
+                MIN(recorded_at) AS submitted_at
+              FROM events
+              WHERE event_type = 'ApplicationSubmitted'
+                AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              GROUP BY 1
+            ),
+            final_decisions AS (
+              SELECT
+                payload ->> 'application_id' AS application_id,
+                MIN(recorded_at) AS decided_at
+              FROM events
+              WHERE event_type IN ('ApplicationApproved', 'ApplicationDeclined')
+              GROUP BY 1
+            ),
+            durations AS (
+              SELECT
+                EXTRACT(EPOCH FROM (f.decided_at - s.submitted_at)) / 3600.0 AS hours_to_decision
+              FROM submissions AS s
+              INNER JOIN final_decisions AS f
+                ON f.application_id = s.application_id
+              WHERE f.decided_at >= s.submitted_at
+            )
+            SELECT
+              COUNT(*) AS decided_applications,
+              AVG(hours_to_decision) AS avg_hours_to_decision,
+              percentile_cont(0.5) WITHIN GROUP (ORDER BY hours_to_decision)
+                AS median_hours_to_decision
+            FROM durations
+            """,
+            effective_window_days,
+        )
+
+        funnel_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(DISTINCT payload ->> 'application_id') FILTER (
+                WHERE event_type = 'ApplicationSubmitted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS submitted_apps,
+              COUNT(DISTINCT payload ->> 'application_id') FILTER (
+                WHERE event_type = 'CreditAnalysisCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS analyzed_apps,
+              COUNT(DISTINCT payload ->> 'application_id') FILTER (
+                WHERE event_type = 'ComplianceCheckCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS compliance_completed_apps,
+              COUNT(DISTINCT payload ->> 'application_id') FILTER (
+                WHERE event_type = 'DecisionGenerated'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS decisioned_apps,
+              COUNT(DISTINCT payload ->> 'application_id') FILTER (
+                WHERE event_type IN ('ApplicationApproved', 'ApplicationDeclined')
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS finalized_apps
+            FROM events
+            WHERE payload ? 'application_id'
+            """,
+            effective_window_days,
+        )
+
+        compliance_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE event_type = 'ComplianceCheckCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS checks_completed,
+              COUNT(*) FILTER (
+                WHERE event_type = 'ComplianceCheckCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  AND payload ->> 'overall_verdict' = 'CLEARED'
+              ) AS checks_cleared,
+              COUNT(*) FILTER (
+                WHERE event_type = 'ComplianceRuleFailed'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS failed_rule_events
+            FROM events
+            """,
+            effective_window_days,
+        )
+
+        top_rule_rows = await conn.fetch(
+            """
+            SELECT
+              payload ->> 'rule_id' AS rule_id,
+              payload ->> 'rule_version' AS rule_version,
+              COUNT(*) AS failures
+            FROM events
+            WHERE event_type = 'ComplianceRuleFailed'
+              AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+            GROUP BY 1, 2
+            ORDER BY failures DESC, rule_id ASC
+            LIMIT 5
+            """,
+            effective_window_days,
+        )
+
+        review_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE event_type = 'HumanReviewCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS reviews_total,
+              COUNT(*) FILTER (
+                WHERE event_type = 'HumanReviewCompleted'
+                  AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  AND LOWER(COALESCE(payload ->> 'override', 'false')) = 'true'
+              ) AS overrides_total
+            FROM events
+            """,
+            effective_window_days,
+        )
+
+        agent_rows = await conn.fetch(
+            """
+            WITH decisions AS (
+              SELECT
+                payload ->> 'application_id' AS application_id,
+                COALESCE(NULLIF(payload ->> 'orchestrator_agent_id', ''), 'unknown') AS agent_id,
+                NULLIF(payload ->> 'confidence_score', '')::double precision AS confidence_score
+              FROM events
+              WHERE event_type = 'DecisionGenerated'
+                AND recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND payload ? 'application_id'
+            ),
+            outcomes AS (
+              SELECT
+                payload ->> 'application_id' AS application_id,
+                CASE
+                  WHEN BOOL_OR(event_type = 'ApplicationApproved') THEN 'APPROVED'
+                  WHEN BOOL_OR(event_type = 'ApplicationDeclined') THEN 'DECLINED'
+                  ELSE NULL
+                END AS outcome
+              FROM events
+              WHERE event_type IN ('ApplicationApproved', 'ApplicationDeclined')
+                AND payload ? 'application_id'
+              GROUP BY 1
+            )
+            SELECT
+              d.agent_id,
+              COUNT(*) AS decisions_generated,
+              AVG(d.confidence_score) AS avg_confidence_score,
+              COUNT(*) FILTER (WHERE o.outcome = 'APPROVED') AS approved_outcomes,
+              COUNT(*) FILTER (WHERE o.outcome = 'DECLINED') AS declined_outcomes
+            FROM decisions AS d
+            LEFT JOIN outcomes AS o
+              ON o.application_id = d.application_id
+            GROUP BY d.agent_id
+            ORDER BY decisions_generated DESC, d.agent_id ASC
+            LIMIT 6
+            """,
+            effective_window_days,
+        )
+
+    submitted = int(kpi_row["submitted"] or 0)
+    approved = int(kpi_row["approved"] or 0)
+    declined = int(kpi_row["declined"] or 0)
+    finalized = approved + declined
+
+    approval_rate_pct: float | None = None
+    if finalized > 0:
+        approval_rate_pct = round((approved / finalized) * 100.0, 2)
+
+    checks_completed = int(compliance_row["checks_completed"] or 0)
+    checks_cleared = int(compliance_row["checks_cleared"] or 0)
+    cleared_rate_pct: float | None = None
+    if checks_completed > 0:
+        cleared_rate_pct = round((checks_cleared / checks_completed) * 100.0, 2)
+
+    reviews_total = int(review_row["reviews_total"] or 0)
+    overrides_total = int(review_row["overrides_total"] or 0)
+    override_rate_pct: float | None = None
+    if reviews_total > 0:
+        override_rate_pct = round((overrides_total / reviews_total) * 100.0, 2)
+
+    trend_window: list[dict[str, Any]] = []
+    for row in trend_rows:
+        approved_on_day = int(row["approved"] or 0)
+        declined_on_day = int(row["declined"] or 0)
+        finalized_on_day = approved_on_day + declined_on_day
+        approval_rate_on_day = (
+            round((approved_on_day / finalized_on_day) * 100.0, 2)
+            if finalized_on_day > 0
+            else None
+        )
+        trend_window.append(
+            {
+                "day": row["day"].isoformat(),
+                "submitted": int(row["submitted"] or 0),
+                "approved": approved_on_day,
+                "declined": declined_on_day,
+                "approval_rate_pct": approval_rate_on_day,
+            }
+        )
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "window_days": effective_window_days,
+        "kpis": {
+            "submitted": submitted,
+            "approved": approved,
+            "declined": declined,
+            "finalized": finalized,
+            "approval_rate_pct": approval_rate_pct,
+            "requested_volume_usd": round(float(kpi_row["requested_volume"] or 0.0), 2),
+            "approved_volume_usd": round(float(kpi_row["approved_volume"] or 0.0), 2),
+            "avg_turnaround_hours": round(
+                float(turnaround_row["avg_hours_to_decision"] or 0.0), 2
+            ),
+            "median_turnaround_hours": round(
+                float(turnaround_row["median_hours_to_decision"] or 0.0), 2
+            ),
+            "turnaround_sample_size": int(turnaround_row["decided_applications"] or 0),
+        },
+        "funnel": {
+            "submitted_apps": int(funnel_row["submitted_apps"] or 0),
+            "analyzed_apps": int(funnel_row["analyzed_apps"] or 0),
+            "compliance_completed_apps": int(funnel_row["compliance_completed_apps"] or 0),
+            "decisioned_apps": int(funnel_row["decisioned_apps"] or 0),
+            "finalized_apps": int(funnel_row["finalized_apps"] or 0),
+        },
+        "compliance": {
+            "checks_completed": checks_completed,
+            "checks_cleared": checks_cleared,
+            "cleared_rate_pct": cleared_rate_pct,
+            "failed_rule_events": int(compliance_row["failed_rule_events"] or 0),
+            "top_failed_rules": [
+                {
+                    "rule_id": str(row["rule_id"] or "unknown"),
+                    "rule_version": str(row["rule_version"] or "unknown"),
+                    "failures": int(row["failures"] or 0),
+                }
+                for row in top_rule_rows
+            ],
+        },
+        "human_review": {
+            "reviews_total": reviews_total,
+            "overrides": overrides_total,
+            "override_rate_pct": override_rate_pct,
+        },
+        "agent_leaderboard": [
+            {
+                "agent_id": str(row["agent_id"]),
+                "decisions_generated": int(row["decisions_generated"] or 0),
+                "avg_confidence_score": (
+                    round(float(row["avg_confidence_score"]), 3)
+                    if row["avg_confidence_score"] is not None
+                    else None
+                ),
+                "approved_outcomes": int(row["approved_outcomes"] or 0),
+                "declined_outcomes": int(row["declined_outcomes"] or 0),
+                "approval_rate_pct": (
+                    round(
+                        (
+                            int(row["approved_outcomes"] or 0)
+                            / (
+                                int(row["approved_outcomes"] or 0)
+                                + int(row["declined_outcomes"] or 0)
+                            )
+                        )
+                        * 100.0,
+                        2,
+                    )
+                    if (int(row["approved_outcomes"] or 0) + int(row["declined_outcomes"] or 0))
+                    > 0
+                    else None
+                ),
+            }
+            for row in agent_rows
+        ],
+        "approval_trend": trend_window,
+        "approval_trend_recent_7d": trend_window[-7:],
+    }
+
+
+def _effective_window_days(window_days: int) -> int:
+    return window_days if window_days in {7, 30, 90} else 30
+
+
+async def _read_projection_metrics_summary(
+    *,
+    store: EventStore,
+    window_days: int = 30,
+) -> dict[str, Any]:
+    effective_window_days = _effective_window_days(window_days)
+
+    async with store._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (
+                WHERE submitted_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS submitted,
+              COUNT(*) FILTER (
+                WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+              ) AS finalized,
+              COUNT(*) FILTER (
+                WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  AND final_decision = 'APPROVE'
+              ) AS approved,
+              COUNT(*) FILTER (
+                WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  AND final_decision = 'DECLINE'
+              ) AS declined,
+              AVG(
+                EXTRACT(EPOCH FROM (finalized_at - submitted_at))
+              ) FILTER (
+                WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                  AND submitted_at IS NOT NULL
+                  AND finalized_at >= submitted_at
+              ) AS avg_processing_seconds
+            FROM client_analytics_projection
+            """,
+            effective_window_days,
+        )
+
+    submitted = int(row["submitted"] or 0)
+    finalized = int(row["finalized"] or 0)
+    approved = int(row["approved"] or 0)
+    declined = int(row["declined"] or 0)
+    approval_rate = round((approved / finalized) * 100.0, 2) if finalized > 0 else 0.0
+    avg_processing_raw = row["avg_processing_seconds"]
+    avg_processing_time = (
+        round(float(avg_processing_raw), 2) if avg_processing_raw is not None else 0.0
+    )
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "window_days": effective_window_days,
+        "submitted": submitted,
+        "finalized": finalized,
+        "approved": approved,
+        "declined": declined,
+        "approval_rate": approval_rate,
+        "avg_processing_time": avg_processing_time,
+    }
+
+
+async def _read_projection_metrics_daily(
+    *,
+    store: EventStore,
+    window_days: int = 30,
+) -> list[dict[str, Any]]:
+    effective_window_days = _effective_window_days(window_days)
+
+    async with store._pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH days AS (
+              SELECT generate_series(
+                date_trunc('day', NOW() - (($1::int - 1) * INTERVAL '1 day')),
+                date_trunc('day', NOW()),
+                INTERVAL '1 day'
+              )::date AS day
+            ),
+            submitted AS (
+              SELECT
+                (submitted_at AT TIME ZONE 'UTC')::date AS day,
+                COUNT(*) AS total
+              FROM client_analytics_projection
+              WHERE submitted_at >= NOW() - ($1::int * INTERVAL '1 day')
+              GROUP BY 1
+            ),
+            approved AS (
+              SELECT
+                (finalized_at AT TIME ZONE 'UTC')::date AS day,
+                COUNT(*) AS total
+              FROM client_analytics_projection
+              WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND final_decision = 'APPROVE'
+              GROUP BY 1
+            ),
+            declined AS (
+              SELECT
+                (finalized_at AT TIME ZONE 'UTC')::date AS day,
+                COUNT(*) AS total
+              FROM client_analytics_projection
+              WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND final_decision = 'DECLINE'
+              GROUP BY 1
+            ),
+            processing AS (
+              SELECT
+                (finalized_at AT TIME ZONE 'UTC')::date AS day,
+                AVG(
+                  EXTRACT(EPOCH FROM (finalized_at - submitted_at))
+                ) AS avg_processing_seconds
+              FROM client_analytics_projection
+              WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND submitted_at IS NOT NULL
+                AND finalized_at >= submitted_at
+              GROUP BY 1
+            )
+            SELECT
+              d.day,
+              COALESCE(s.total, 0) AS submitted,
+              COALESCE(a.total, 0) AS approved,
+              COALESCE(k.total, 0) AS declined,
+              COALESCE(p.avg_processing_seconds, 0) AS avg_processing_seconds
+            FROM days AS d
+            LEFT JOIN submitted AS s ON s.day = d.day
+            LEFT JOIN approved AS a ON a.day = d.day
+            LEFT JOIN declined AS k ON k.day = d.day
+            LEFT JOIN processing AS p ON p.day = d.day
+            ORDER BY d.day ASC
+            """,
+            effective_window_days,
+        )
+
+    return [
+        {
+            "date": row["day"].isoformat(),
+            "submitted": int(row["submitted"] or 0),
+            "approved": int(row["approved"] or 0),
+            "declined": int(row["declined"] or 0),
+            "avg_processing_seconds": round(float(row["avg_processing_seconds"] or 0.0), 2),
+        }
+        for row in rows
+    ]
+
+
+async def _read_projection_metrics_agents(
+    *,
+    store: EventStore,
+    window_days: int = 30,
+) -> list[dict[str, Any]]:
+    effective_window_days = _effective_window_days(window_days)
+
+    async with store._pool.acquire() as conn:
+        activity_rows = await conn.fetch(
+            """
+            WITH activity_events AS (
+              SELECT
+                COALESCE(NULLIF(payload ->> 'agent_id', ''), 'unknown') AS agent_id,
+                COUNT(*)::bigint AS event_count
+              FROM events
+              WHERE recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND event_type IN (
+                  'AgentContextLoaded',
+                  'CreditAnalysisCompleted',
+                  'FraudScreeningCompleted'
+                )
+              GROUP BY 1
+              UNION ALL
+              SELECT
+                COALESCE(NULLIF(payload ->> 'orchestrator_agent_id', ''), 'unknown') AS agent_id,
+                COUNT(*)::bigint AS event_count
+              FROM events
+              WHERE recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND event_type = 'DecisionGenerated'
+              GROUP BY 1
+              UNION ALL
+              SELECT
+                COALESCE(NULLIF(payload ->> 'reviewer_id', ''), 'unknown') AS agent_id,
+                COUNT(*)::bigint AS event_count
+              FROM events
+              WHERE recorded_at >= NOW() - ($1::int * INTERVAL '1 day')
+                AND event_type = 'HumanReviewCompleted'
+              GROUP BY 1
+            )
+            SELECT
+              agent_id,
+              SUM(event_count)::bigint AS activity_score
+            FROM activity_events
+            WHERE agent_id IS NOT NULL AND agent_id <> ''
+            GROUP BY 1
+            ORDER BY activity_score DESC, agent_id ASC
+            """,
+            effective_window_days,
+        )
+        decision_rows = await conn.fetch(
+            """
+            SELECT
+              COALESCE(NULLIF(decision_agent_id, ''), 'unknown') AS agent_id,
+              COUNT(*) AS decisions,
+              COUNT(*) FILTER (WHERE final_decision = 'APPROVE') AS approved,
+              COUNT(*) FILTER (WHERE final_decision = 'DECLINE') AS declined
+            FROM client_analytics_projection
+            WHERE finalized_at >= NOW() - ($1::int * INTERVAL '1 day')
+              AND final_decision IN ('APPROVE', 'DECLINE')
+            GROUP BY 1
+            ORDER BY decisions DESC, agent_id ASC
+            """,
+            effective_window_days,
+        )
+
+    by_agent: dict[str, dict[str, Any]] = {}
+    for row in activity_rows:
+        agent_id = str(row["agent_id"])
+        by_agent[agent_id] = {
+            "agent_id": agent_id,
+            "activity_score": int(row["activity_score"] or 0),
+            "decisions": 0,
+            "approval_rate": 0.0,
+        }
+
+    for row in decision_rows:
+        agent_id = str(row["agent_id"])
+        approved = int(row["approved"] or 0)
+        declined = int(row["declined"] or 0)
+        decided = approved + declined
+        if agent_id not in by_agent:
+            by_agent[agent_id] = {
+                "agent_id": agent_id,
+                "activity_score": 0,
+                "decisions": 0,
+                "approval_rate": 0.0,
+            }
+        by_agent[agent_id]["decisions"] = int(row["decisions"] or 0)
+        by_agent[agent_id]["approval_rate"] = (
+            round((approved / decided) * 100.0, 2) if decided > 0 else 0.0
+        )
+
+    return sorted(
+        by_agent.values(),
+        key=lambda item: (
+            -int(item["activity_score"]),
+            -int(item["decisions"]),
+            str(item["agent_id"]),
+        ),
+    )
 
 
 async def _ensure_auth_schema(store: EventStore) -> None:

@@ -48,7 +48,8 @@ def _reset_database(database_url: str) -> None:
                   application_summary_projection,
                   compliance_audit_state_projection,
                   compliance_audit_view_projection,
-                  agent_performance_projection
+                  agent_performance_projection,
+                  client_analytics_projection
                 RESTART IDENTITY CASCADE
                 """
             )
@@ -113,3 +114,42 @@ def test_api_bootstrap_and_views() -> None:
         assert metrics.status_code == 200
         assert "ledger_projection_events_behind" in metrics.text
         assert "ledger_projection_checkpoint_age_ms" in metrics.text
+        assert "ledger_outbox_pending" in metrics.text
+
+        delivery = client.get("/api/v1/ledger/delivery", headers=headers)
+        assert delivery.status_code == 200
+        delivery_json = delivery.json()
+        assert delivery_json["ok"] is True
+        assert "outbox" in delivery_json["result"]
+        assert "throughput" in delivery_json["result"]
+
+        analytics = client.get("/api/v1/analytics/summary?window_days=7", headers=headers)
+        assert analytics.status_code == 200
+        analytics_json = analytics.json()
+        assert analytics_json["ok"] is True
+        assert analytics_json["result"]["window_days"] == 7
+        assert analytics_json["result"]["kpis"]["submitted"] >= 1
+        assert "approval_trend" in analytics_json["result"]
+
+        analytics_invalid = client.get("/api/v1/analytics/summary?window_days=14", headers=headers)
+        assert analytics_invalid.status_code == 422
+
+        metrics_summary = client.get("/api/v1/metrics/summary?window_days=30", headers=headers)
+        assert metrics_summary.status_code == 200
+        metrics_summary_json = metrics_summary.json()
+        assert metrics_summary_json["ok"] is True
+        assert metrics_summary_json["result"]["submitted"] >= 1
+        assert "approval_rate" in metrics_summary_json["result"]
+
+        metrics_daily = client.get("/api/v1/metrics/daily?window_days=7", headers=headers)
+        assert metrics_daily.status_code == 200
+        metrics_daily_json = metrics_daily.json()
+        assert metrics_daily_json["ok"] is True
+        assert isinstance(metrics_daily_json["result"], list)
+        assert len(metrics_daily_json["result"]) == 7
+
+        metrics_agents = client.get("/api/v1/metrics/agents?window_days=30", headers=headers)
+        assert metrics_agents.status_code == 200
+        metrics_agents_json = metrics_agents.json()
+        assert metrics_agents_json["ok"] is True
+        assert isinstance(metrics_agents_json["result"], list)

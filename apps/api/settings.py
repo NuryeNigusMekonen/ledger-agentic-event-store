@@ -77,12 +77,15 @@ class AppSettings:
     jwt_issuer: str = "ledger-api"
     jwt_ttl_minutes: int = 120
     seed_demo_users: bool = True
+    outbox_publisher: str = "sink"
+    kafka_bootstrap_servers: str | None = None
 
     @classmethod
     def from_env(cls) -> AppSettings:
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             raise RuntimeError("DATABASE_URL is required to start the API service.")
+        outbox_publisher = os.getenv("OUTBOX_PUBLISHER", "sink").strip().lower() or "sink"
 
         return cls(
             database_url=database_url,
@@ -98,4 +101,6 @@ class AppSettings:
             jwt_issuer=os.getenv("JWT_ISSUER", "ledger-api"),
             jwt_ttl_minutes=int(os.getenv("JWT_TTL_MINUTES", "120")),
             seed_demo_users=_env_bool("SEED_DEMO_USERS", True),
+            outbox_publisher=outbox_publisher,
+            kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS") or None,
         )

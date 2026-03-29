@@ -59,7 +59,8 @@ async def server() -> LedgerMCPServer:
               application_summary_projection,
               compliance_audit_state_projection,
               compliance_audit_view_projection,
-              agent_performance_projection
+              agent_performance_projection,
+              client_analytics_projection
             RESTART IDENTITY CASCADE
             """
         )

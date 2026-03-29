@@ -8,6 +8,7 @@ from src.mcp.resources import LedgerMCPResources
 from src.mcp.tools import LedgerMCPTools
 from src.projections.agent_performance import AgentPerformanceLedgerProjection
 from src.projections.application_summary import ApplicationSummaryProjection
+from src.projections.client_analytics import ClientAnalyticsProjection
 from src.projections.compliance_audit import ComplianceAuditViewProjection
 from src.projections.daemon import ProjectionDaemon
 
@@ -28,6 +29,7 @@ class LedgerMCPServer:
                 ApplicationSummaryProjection(),
                 self.compliance_projection,
                 AgentPerformanceLedgerProjection(),
+                ClientAnalyticsProjection(),
             ],
             batch_size=200,
             max_retries=3,
@@ -72,4 +74,3 @@ class LedgerMCPServer:
         if not self.auto_project:
             return
         await self.daemon.run_once()
-
