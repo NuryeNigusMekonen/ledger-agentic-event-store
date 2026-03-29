@@ -25,6 +25,125 @@ export type LedgerHealth = {
   projections: Record<string, ProjectionLag>;
 };
 
+export type DeliveryHealth = {
+  status: string;
+  transport: {
+    mode: string;
+    status: string;
+    detail: string;
+    broker: string | null;
+  };
+  outbox: {
+    pending: number;
+    retrying: number;
+    dead_letter: number;
+    published_total: number;
+    due_now: number;
+    pending_avg_attempts: number;
+    oldest_pending_age_ms: number | null;
+    last_published_at: string | null;
+  };
+  throughput: {
+    published_last_5m: number;
+    published_last_1h: number;
+  };
+  topics: Array<{
+    topic: string;
+    pending: number;
+    dead_letter: number;
+    published_last_1h: number;
+  }>;
+  updated_at: string;
+};
+
+export type AnalyticsSummary = {
+  generated_at: string;
+  window_days: 7 | 30 | 90;
+  kpis: {
+    submitted: number;
+    approved: number;
+    declined: number;
+    finalized: number;
+    approval_rate_pct: number | null;
+    requested_volume_usd: number;
+    approved_volume_usd: number;
+    avg_turnaround_hours: number;
+    median_turnaround_hours: number;
+    turnaround_sample_size: number;
+  };
+  funnel: {
+    submitted_apps: number;
+    analyzed_apps: number;
+    compliance_completed_apps: number;
+    decisioned_apps: number;
+    finalized_apps: number;
+  };
+  compliance: {
+    checks_completed: number;
+    checks_cleared: number;
+    cleared_rate_pct: number | null;
+    failed_rule_events: number;
+    top_failed_rules: Array<{
+      rule_id: string;
+      rule_version: string;
+      failures: number;
+    }>;
+  };
+  human_review: {
+    reviews_total: number;
+    overrides: number;
+    override_rate_pct: number | null;
+  };
+  agent_leaderboard: Array<{
+    agent_id: string;
+    decisions_generated: number;
+    avg_confidence_score: number | null;
+    approved_outcomes: number;
+    declined_outcomes: number;
+    approval_rate_pct: number | null;
+  }>;
+  approval_trend: Array<{
+    day: string;
+    submitted: number;
+    approved: number;
+    declined: number;
+    approval_rate_pct: number | null;
+  }>;
+  approval_trend_recent_7d: Array<{
+    day: string;
+    submitted: number;
+    approved: number;
+    declined: number;
+    approval_rate_pct: number | null;
+  }>;
+};
+
+export type MetricsSummary = {
+  generated_at: string;
+  window_days: 7 | 30 | 90;
+  submitted: number;
+  finalized: number;
+  approved: number;
+  declined: number;
+  approval_rate: number;
+  avg_processing_time: number;
+};
+
+export type MetricsDailyPoint = {
+  date: string;
+  submitted: number;
+  approved: number;
+  declined: number;
+  avg_processing_seconds: number;
+};
+
+export type MetricsAgentPoint = {
+  agent_id: string;
+  activity_score: number;
+  decisions: number;
+  approval_rate: number;
+};
+
 export type ApplicationSummary = {
   application_id: string;
   current_state: string;

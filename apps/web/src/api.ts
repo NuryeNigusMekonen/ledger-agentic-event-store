@@ -1,12 +1,17 @@
 import type {
   AgentPerformance,
   AgentSessionReplay,
+  AnalyticsSummary,
   AuditTrail,
   ApiEnvelope,
   AppStateCount,
   ApplicationSummary,
   ComplianceView,
+  DeliveryHealth,
   LedgerHealth,
+  MetricsAgentPoint,
+  MetricsDailyPoint,
+  MetricsSummary,
   RecentEvent,
   ResourceDefinition,
   ToolDefinition
@@ -169,6 +174,26 @@ export async function bootstrapDemo(applicationId?: string): Promise<Record<stri
 
 export async function fetchLedgerHealth(): Promise<LedgerHealth> {
   return await apiRequest<LedgerHealth>("/ledger/health");
+}
+
+export async function fetchDeliveryHealth(): Promise<DeliveryHealth> {
+  return await apiRequest<DeliveryHealth>("/ledger/delivery");
+}
+
+export async function fetchAnalyticsSummary(windowDays: 7 | 30 | 90 = 30): Promise<AnalyticsSummary> {
+  return await apiRequest<AnalyticsSummary>(`/analytics/summary?window_days=${windowDays}`);
+}
+
+export async function fetchMetricsSummary(windowDays: 7 | 30 | 90 = 30): Promise<MetricsSummary> {
+  return await apiRequest<MetricsSummary>(`/metrics/summary?window_days=${windowDays}`);
+}
+
+export async function fetchMetricsDaily(windowDays: 7 | 30 | 90 = 30): Promise<MetricsDailyPoint[]> {
+  return await apiRequest<MetricsDailyPoint[]>(`/metrics/daily?window_days=${windowDays}`);
+}
+
+export async function fetchMetricsAgents(windowDays: 7 | 30 | 90 = 30): Promise<MetricsAgentPoint[]> {
+  return await apiRequest<MetricsAgentPoint[]>(`/metrics/agents?window_days=${windowDays}`);
 }
 
 export async function fetchApplicationStates(): Promise<AppStateCount[]> {
