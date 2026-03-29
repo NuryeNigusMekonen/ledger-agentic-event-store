@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNo
 import {
   bootstrapDemo,
   clearStoredToken,
+  fetchDeliveryHealth,
   fetchAgentPerformance,
   fetchAgentSession,
   fetchAllApplications,
@@ -15,6 +16,9 @@ import {
   fetchCompliance,
   fetchLedgerHealth,
   fetchMe,
+  fetchMetricsAgents,
+  fetchMetricsDaily,
+  fetchMetricsSummary,
   fetchRecentEvents,
   fetchResourceByUri,
   fetchTools,
@@ -31,12 +35,27 @@ import type {
   ApplicationSummary,
   ComplianceTimelineEvent,
   ComplianceView,
+  DeliveryHealth,
   LedgerHealth,
+  MetricsAgentPoint,
+  MetricsDailyPoint,
+  MetricsSummary,
   RecentEvent,
   ResourceDefinition,
   ToolDefinition
 } from "./types";
 import apexLogo from "../logo/logo.png";
+import BarChartAgents from "./components/charts/BarChartAgents";
+import LineChartDaily from "./components/charts/LineChartDaily";
+import LineChartProcessing from "./components/charts/LineChartProcessing";
+import PieChartApproval from "./components/charts/PieChartApproval";
+import BarChartTopicMessages from "./components/charts/BarChartTopicMessages";
+import {
+  formatCount as formatBusinessCount,
+  formatDuration as formatBusinessDuration,
+  formatPercent as formatBusinessPercent,
+  formatTimestamp as formatBusinessTimestamp
+} from "./utils/formatters";
 
 const DEFAULT_COMMAND_PAYLOAD: Record<string, Record<string, unknown>> = {
   submit_application: {
@@ -83,9 +102,9 @@ const OPERATING_FABRIC = [
 ] as const;
 
 type Tone = "ok" | "warning" | "critical" | "neutral" | "info";
-type WorkspaceMode = "operations" | "audit" | "system";
 type TimelinePhase = "Intake" | "Analysis" | "Compliance" | "Decision" | "Final Outcome";
 type EventTimeRange = "all" | "1h" | "24h" | "7d" | "30d";
+type AnalyticsWindowDays = 7 | 30 | 90;
 
 type LineageItem = {
   key: string;
@@ -128,14 +147,6 @@ type ExpectedEventGroup = {
   label: string;
   eventTypes: string[];
 };
-
-const EVIDENCE_PANEL_KEYS: EvidencePanelKey[] = [
-  "integrity",
-  "snapshot",
-  "lineage",
-  "activity",
-  "compliance"
-];
 
 const EXPECTED_EVENT_GROUPS: ExpectedEventGroup[] = [
   {
@@ -187,15 +198,10 @@ const EXPECTED_EVENT_TYPES = Array.from(
   new Set(EXPECTED_EVENT_GROUPS.flatMap((group) => group.eventTypes))
 );
 
+const ANALYTICS_WINDOWS: AnalyticsWindowDays[] = [7, 30, 90];
+
 function prettyDate(value: string | null | undefined): string {
-  if (!value) {
-    return "Not available";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return date.toLocaleString();
+  return formatBusinessTimestamp(value);
 }
 
 function prettyDateCompact(value: string | null | undefined): string {
@@ -335,6 +341,18 @@ function formatLagMs(value: number): string {
     return "n/a";
   }
   return `${Math.round(value).toLocaleString()} ms`;
+}
+
+function formatCount(value: number | null | undefined): string {
+  return formatBusinessCount(value);
+}
+
+function formatPercent(value: number | null | undefined, digits = 1): string {
+  return formatBusinessPercent(value, digits);
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  return formatBusinessDuration(seconds);
 }
 
 function previewJson(value: unknown): string {
@@ -1059,6 +1077,313 @@ function ProjectionHealthPanel(props: {
   );
 }
 
+function DeliveryHealthPanel(props: { delivery: DeliveryHealth | null }): ReactNode {
+  if (!props.delivery) {
+    return (
+      <section className="panel operations-health-panel system-health">
+        <div className="panel-heading">
+          <div>
+            <p className="section-kicker">System Health</p>
+            <h2>Kafka outbox and transport</h2>
+          </div>
+        </div>
+        <p className="empty-state">No delivery health snapshot available yet.</p>
+      </section>
+    );
+  }
+
+  const { delivery } = props;
+  const tone = toTone(delivery.status);
+  const brokerHost = delivery.transport.broker ?? "Not configured";
+  const sortedTopics = [...delivery.topics].sort(
+    (left, right) => right.published_last_1h - left.published_last_1h
+  );
+  const hasTopicTraffic = sortedTopics.some(
+    (topic) => topic.published_last_1h > 0 || topic.pending > 0 || topic.dead_letter > 0
+  );
+
+  return (
+    <section className="panel operations-health-panel system-health">
+      <div className="panel-heading">
+        <div>
+          <p className="section-kicker">System Health</p>
+          <h2>Kafka outbox and transport</h2>
+        </div>
+        <StatusBadge label={titleize(delivery.status)} tone={tone} />
+      </div>
+
+      <div className="operations-health-grid">
+        <article className="operations-health-card">
+          <span>Status</span>
+          <strong>
+            <span className={`health-indicator health-${tone}`} aria-hidden="true" />
+            {titleize(delivery.status)}
+          </strong>
+          <small>Outbox relay health</small>
+        </article>
+        <article className="operations-health-card">
+          <span>Pending</span>
+          <strong>{formatCount(delivery.outbox.pending)}</strong>
+          <small>
+            Oldest age{" "}
+            {delivery.outbox.oldest_pending_age_ms === null
+              ? "n/a"
+              : formatLagMs(delivery.outbox.oldest_pending_age_ms)}
+          </small>
+        </article>
+        <article className="operations-health-card">
+          <span>Retrying</span>
+          <strong>{formatCount(delivery.outbox.retrying)}</strong>
+          <small>Messages currently being retried</small>
+        </article>
+        <article className="operations-health-card">
+          <span>Dead-letter</span>
+          <strong>{formatCount(delivery.outbox.dead_letter)}</strong>
+          <small>Messages requiring manual review</small>
+        </article>
+        <article className="operations-health-card">
+          <span>Total published</span>
+          <strong>{formatCount(delivery.outbox.published_total)}</strong>
+          <small>{`${formatCount(delivery.throughput.published_last_5m)} in last 5m`}</small>
+        </article>
+      </div>
+
+      <div className="operations-broker-panel">
+        <div className="panel-subhead">
+          <h3>Broker connection</h3>
+          <span className="section-note">Last published: {prettyDate(delivery.outbox.last_published_at)}</span>
+        </div>
+        <div className="definition-list compact operations-broker-grid">
+          <div>
+            <span>Broker type</span>
+            <strong>{titleize(delivery.transport.mode)}</strong>
+          </div>
+          <div>
+            <span>Host</span>
+            <strong>{brokerHost}</strong>
+          </div>
+          <div>
+            <span>Transport status</span>
+            <strong>{titleize(delivery.transport.status)}</strong>
+          </div>
+        </div>
+        <p className="projection-note">{delivery.transport.detail}</p>
+      </div>
+
+      {sortedTopics.length > 0 ? (
+        <div className="operations-topic-block">
+          <div className="panel-subhead">
+            <h3>Topic delivery</h3>
+            <span className="section-note">{prettyDate(delivery.updated_at)}</span>
+          </div>
+
+          <div className="operations-topic-table-wrap">
+            <table className="operations-topic-table">
+              <thead>
+                <tr>
+                  <th scope="col">Topic</th>
+                  <th scope="col">Published</th>
+                  <th scope="col">Pending</th>
+                  <th scope="col">DLQ</th>
+                  <th scope="col">Last published</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedTopics.map((topic) => (
+                  <tr key={topic.topic}>
+                    <td>
+                      <strong>{topic.topic}</strong>
+                    </td>
+                    <td>{formatCount(topic.published_last_1h)}</td>
+                    <td>{formatCount(topic.pending)}</td>
+                    <td>{formatCount(topic.dead_letter)}</td>
+                    <td>{prettyDate(delivery.outbox.last_published_at ?? delivery.updated_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {hasTopicTraffic ? (
+            <div className="operations-topic-chart">
+              <h3>Messages per topic</h3>
+              <p>Published in the last hour</p>
+              <div className="operations-topic-chart-canvas">
+                <BarChartTopicMessages topics={sortedTopics} />
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <p className="empty-state">No topic activity has been recorded yet.</p>
+      )}
+    </section>
+  );
+}
+
+function AnalyticsChartCard(props: {
+  title: string;
+  subtitle: string;
+  hasData: boolean;
+  children: ReactNode;
+  compact?: boolean;
+}): ReactNode {
+  return (
+    <article className="analytics-chart-card chart-card">
+      <header>
+        <h3>{props.title}</h3>
+        <p>{props.subtitle}</p>
+      </header>
+      <div className={`analytics-chart-canvas ${props.compact ? "analytics-chart-canvas-pie" : ""}`}>
+        {props.hasData ? props.children : <p className="analytics-chart-empty">No data available for this period</p>}
+      </div>
+    </article>
+  );
+}
+
+function ClientAnalyticsPanel(props: {
+  summary: MetricsSummary | null;
+  daily: MetricsDailyPoint[];
+  agents: MetricsAgentPoint[];
+  selectedWindow: AnalyticsWindowDays;
+  onWindowChange: (value: AnalyticsWindowDays) => void;
+  className?: string;
+}): ReactNode {
+  const panelClassName = props.className
+    ? `panel dashboard-analytics ${props.className}`
+    : "panel dashboard-analytics";
+
+  if (!props.summary) {
+    return (
+      <section className={panelClassName}>
+        <div className="panel-heading">
+          <div>
+            <p className="section-kicker">Client Analytics</p>
+            <h2>Business performance dashboard</h2>
+          </div>
+        </div>
+        <p className="empty-state">Projection metrics are loading or no projected data is available yet.</p>
+      </section>
+    );
+  }
+
+  const { summary, daily, agents } = props;
+  const approvalTone: Tone =
+    summary.approval_rate >= 70
+      ? "ok"
+      : summary.approval_rate >= 50
+        ? "warning"
+        : "critical";
+  const windowLabel = `${summary.window_days}d`;
+  const hasDailyData = daily.some(
+    (point) => point.submitted > 0 || point.approved > 0 || point.declined > 0
+  );
+  const hasOutcomeData = summary.approved + summary.declined > 0;
+  const hasAgentData = agents.some(
+    (agent) => Number(agent.activity_score ?? 0) > 0 || Number(agent.decisions ?? 0) > 0
+  );
+  const hasProcessingData = daily.some((point) => point.avg_processing_seconds > 0);
+
+  return (
+    <section className={panelClassName}>
+      <div className="panel-heading analytics-heading">
+        <div>
+          <p className="section-kicker">Client Analytics</p>
+          <h2>Business performance dashboard</h2>
+        </div>
+        <div className="analytics-heading-controls">
+          <div className="analytics-window-switch" aria-label="Analytics window">
+            {ANALYTICS_WINDOWS.map((windowDays) => (
+              <button
+                key={windowDays}
+                type="button"
+                className={`button subtle analytics-window-button ${props.selectedWindow === windowDays ? "active" : ""}`}
+                onClick={() => props.onWindowChange(windowDays)}
+              >
+                {windowDays}d
+              </button>
+            ))}
+          </div>
+          <StatusBadge
+            label={`${windowLabel} approval ${formatPercent(summary.approval_rate, 1)}`}
+            tone={approvalTone}
+          />
+        </div>
+      </div>
+
+      <div className="analytics-kpi-grid kpi-row">
+        <article className="analytics-kpi-card">
+          <span>Total submitted</span>
+          <strong>{formatCount(summary.submitted)}</strong>
+          <small className="kpi-helper">{`Across the last ${summary.window_days} days`}</small>
+        </article>
+        <article className="analytics-kpi-card">
+          <span>Approval rate</span>
+          <strong>{formatPercent(summary.approval_rate, 1)}</strong>
+          <small className="kpi-helper">Approved applications out of finalized decisions</small>
+        </article>
+        <article className="analytics-kpi-card">
+          <span>Avg processing time</span>
+          <strong>{formatDuration(summary.avg_processing_time)}</strong>
+          <small className="kpi-helper">Auto-formatted in sec/min for readability</small>
+        </article>
+        <article className="analytics-kpi-card">
+          <span>Finalized</span>
+          <strong>{formatCount(summary.finalized)}</strong>
+          <small className="kpi-helper">Applications with a final decision</small>
+        </article>
+      </div>
+
+      <div className="analytics-chart-grid analytics-chart-grid-mid">
+        <AnalyticsChartCard
+          title="Daily applications and approvals"
+          subtitle={`Last ${summary.window_days} days`}
+          hasData={hasDailyData}
+        >
+          <>
+            <LineChartDaily points={daily} />
+          </>
+        </AnalyticsChartCard>
+
+        <AnalyticsChartCard
+          title="Decision outcome split"
+          subtitle={`Approved vs declined • total ${formatCount(summary.approved + summary.declined)}`}
+          hasData={hasOutcomeData}
+          compact
+        >
+          <>
+            <PieChartApproval approved={summary.approved} declined={summary.declined} />
+          </>
+        </AnalyticsChartCard>
+      </div>
+
+      <div className="analytics-chart-grid analytics-chart-grid-bottom">
+        <AnalyticsChartCard
+          title="Agent activity"
+          subtitle="Activity score by agent (sessions, analyses, decisions, reviews)"
+          hasData={hasAgentData}
+        >
+          <>
+            <BarChartAgents agents={agents} />
+          </>
+        </AnalyticsChartCard>
+
+        <AnalyticsChartCard
+          title="Average processing time"
+          subtitle="Daily average time"
+          hasData={hasProcessingData}
+        >
+          <>
+            <LineChartProcessing points={daily} />
+          </>
+        </AnalyticsChartCard>
+      </div>
+
+      <p className="section-note">Last updated: {formatBusinessTimestamp(summary.generated_at)}</p>
+    </section>
+  );
+}
+
 function MCPResourcePanel(props: {
   resourceUri: string;
   onResourceUriChange: (value: string) => void;
@@ -1068,9 +1393,14 @@ function MCPResourcePanel(props: {
   resourceHistory: ResourceQueryHistoryEntry[];
   resourceDefinitions: ResourceDefinition[];
   resourceResult: string;
+  className?: string;
 }): ReactNode {
+  const isSidebar = props.className?.includes("sidebar-mcp") ?? false;
+  const resourceOutput =
+    props.resourceResult || (props.resourceBusy ? "Loading resource output..." : "Resource output appears here after loading a ledger URI.");
+
   return (
-    <section className="panel mcp-panel">
+    <section className={`panel mcp-panel ${props.className ?? ""}`.trim()}>
       <div className="panel-heading">
         <div>
           <p className="section-kicker">MCP Query Output</p>
@@ -1086,14 +1416,16 @@ function MCPResourcePanel(props: {
             <input
               value={props.resourceUri}
               onChange={(event) => props.onResourceUriChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  props.onInspectResource();
+                }
+              }}
               placeholder="ledger://applications/app-.../compliance"
             />
           </label>
-          <div className="quick-actions">
-            <button className="button" onClick={() => props.onInspectResource()} disabled={props.resourceBusy}>
-              {props.resourceBusy ? "Loading resource..." : "Load resource"}
-            </button>
-          </div>
+
           <div className="tag-list">
             {props.resourceQuickPicks.map((item) => (
               <button
@@ -1109,6 +1441,16 @@ function MCPResourcePanel(props: {
               </button>
             ))}
           </div>
+
+          {isSidebar ? (
+            <div className="mcp-results mcp-results-inline">
+              <div className="panel-subhead">
+                <strong>Resource output</strong>
+                <span>{props.resourceHistory[0]?.uri ?? "Awaiting query"}</span>
+              </div>
+              <pre className="result-box">{resourceOutput}</pre>
+            </div>
+          ) : null}
 
           <details className="detail-block">
             <summary>Resource catalogue ({props.resourceDefinitions.length})</summary>
@@ -1129,47 +1471,7 @@ function MCPResourcePanel(props: {
         </div>
 
         <div className="mcp-results">
-          <div className="mcp-history">
-            <div className="panel-subhead">
-              <strong>Recent queries</strong>
-              <span>{props.resourceHistory.length}</span>
-            </div>
-            {props.resourceHistory.length === 0 ? (
-              <p className="empty-state">No MCP resource queries loaded yet.</p>
-            ) : (
-              <div className="mini-timeline resource-catalogue">
-                {props.resourceHistory.map((entry) => (
-                  <button
-                    type="button"
-                    className="checkpoint-button"
-                    key={`${entry.uri}-${entry.loadedAt}`}
-                    onClick={() => {
-                      props.onResourceUriChange(entry.uri);
-                      props.onInspectResource(entry.uri);
-                    }}
-                  >
-                    <span className="checkpoint-event">{entry.uri}</span>
-                    <span className="resource-description">{entry.preview}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="definition-list compact mcp-preview-grid">
-            <div>
-              <span>Last response preview</span>
-              <strong>{props.resourceHistory[0]?.preview ?? "Not loaded"}</strong>
-            </div>
-            <div>
-              <span>Most recent query</span>
-              <strong>{props.resourceHistory[0]?.uri ?? "Not loaded"}</strong>
-            </div>
-          </div>
-
-          <pre className="result-box">
-            {props.resourceResult || "Resource output appears here after loading a ledger URI."}
-          </pre>
+          {isSidebar ? null : <pre className="result-box">{resourceOutput}</pre>}
         </div>
       </div>
     </section>
@@ -1304,7 +1606,6 @@ function AuditPhaseTimeline(props: {
   filteredCount: number;
   applicationId: string;
   showMetadata: boolean;
-  onToggleMetadata: () => void;
 }): ReactNode {
   return (
     <section className="panel lineage-panel">
@@ -1315,9 +1616,6 @@ function AuditPhaseTimeline(props: {
         </div>
         <div className="panel-actions">
           <p className="section-note">{props.filteredCount} filtered events</p>
-          <button type="button" className="text-button" onClick={props.onToggleMetadata}>
-            {props.showMetadata ? "Hide metadata" : "Show metadata"}
-          </button>
         </div>
       </div>
 
@@ -1532,14 +1830,6 @@ function EventCoveragePanel(props: {
   );
 }
 
-function countFailedChecks(snapshot: Record<string, unknown> | null | undefined): number {
-  if (!snapshot) {
-    return 0;
-  }
-  const failedChecks = readRecord(snapshot.failed_checks);
-  return Object.keys(failedChecks).length;
-}
-
 function assessProjection(lag: {
   events_behind: number;
   lag_ms: number;
@@ -1601,6 +1891,11 @@ export default function App() {
   const [temporalCompliance, setTemporalCompliance] = useState<ComplianceView | null>(null);
   const [agentPerformance, setAgentPerformance] = useState<AgentPerformance | null>(null);
   const [health, setHealth] = useState<LedgerHealth | null>(null);
+  const [deliveryHealth, setDeliveryHealth] = useState<DeliveryHealth | null>(null);
+  const [metricsSummary, setMetricsSummary] = useState<MetricsSummary | null>(null);
+  const [metricsDaily, setMetricsDaily] = useState<MetricsDailyPoint[]>([]);
+  const [metricsAgents, setMetricsAgents] = useState<MetricsAgentPoint[]>([]);
+  const [analyticsWindow, setAnalyticsWindow] = useState<AnalyticsWindowDays>(30);
   const [recentEvents, setRecentEvents] = useState<RecentEvent[]>([]);
   const [applicationEvents, setApplicationEvents] = useState<RecentEvent[]>([]);
   const [integrityTrail, setIntegrityTrail] = useState<RecentEvent[]>([]);
@@ -1624,7 +1919,6 @@ export default function App() {
   const [notice, setNotice] = useState<string>("");
   const [noticeToastVisible, setNoticeToastVisible] = useState<boolean>(true);
   const [lastRefresh, setLastRefresh] = useState<string>(new Date().toISOString());
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("operations");
   const [evidencePanels, setEvidencePanels] = useState<Record<EvidencePanelKey, boolean>>({
     integrity: false,
     snapshot: false,
@@ -1884,21 +2178,6 @@ export default function App() {
     };
   }, [applicationLineage.length, integrityTrail]);
 
-  const temporalDelta = useMemo(() => {
-    const currentStatus =
-      application?.compliance_status ??
-      readString(compliance?.snapshot.compliance_status) ??
-      "NOT_STARTED";
-    const temporalStatus = readString(temporalCompliance?.snapshot.compliance_status);
-    if (!temporalStatus) {
-      return "Select a checkpoint to reconstruct the compliance state.";
-    }
-    if (temporalStatus === currentStatus) {
-      return `State matches the live compliance posture (${titleize(currentStatus)}).`;
-    }
-    return `State diverges from current posture: ${titleize(temporalStatus)} then, ${titleize(currentStatus)} now.`;
-  }, [application, compliance, temporalCompliance]);
-
   const fabricRows = useMemo(() => {
     const scopedOperationalEvents = applicationId
       ? [...applicationLineage]
@@ -2011,35 +2290,22 @@ export default function App() {
   }, [fabricRows, humanReviewState]);
 
   const currentComplianceSnapshot = readRecord(compliance?.snapshot);
-  const temporalSnapshot = readRecord(temporalCompliance?.snapshot);
-  const currentFailedChecks = countFailedChecks(currentComplianceSnapshot);
-  const temporalFailedChecks = countFailedChecks(temporalSnapshot);
   const hasIntegrityCommand = authUser?.allowed_commands.includes("run_integrity_check") ?? false;
   const primaryPipelineState = states[0];
-  const isOperationsView = workspaceMode === "operations";
-  const isAuditView = workspaceMode === "audit";
-  const isSystemView = workspaceMode === "system";
-  const allEvidenceExpanded = useMemo(() => {
-    return EVIDENCE_PANEL_KEYS.every((panel) => evidencePanels[panel]);
-  }, [evidencePanels]);
-  const activityMaxCount = 16;
-  const activityWindow = recentEvents.slice(0, activityMaxCount);
-  const visibleActivity = activityWindow;
-  const applicationRegisterLimit = isOperationsView ? 10 : 12;
+  const applicationRegisterLimit = 10;
   const visibleApplicationRows = applications.slice(0, applicationRegisterLimit);
-  const replayCheckpointCount = isOperationsView ? 3 : 6;
 
   const toggleEvidencePanel = useCallback((panel: EvidencePanelKey) => {
     setEvidencePanels((current) => ({ ...current, [panel]: !current[panel] }));
   }, []);
 
-  const setAllEvidencePanels = useCallback((expanded: boolean) => {
+  const collapseEvidencePanels = useCallback(() => {
     setEvidencePanels({
-      integrity: expanded,
-      snapshot: expanded,
-      lineage: expanded,
-      activity: expanded,
-      compliance: expanded
+      integrity: false,
+      snapshot: false,
+      lineage: false,
+      activity: false,
+      compliance: false
     });
   }, []);
 
@@ -2053,6 +2319,9 @@ export default function App() {
     setCommandResult("");
     setLastIntegrityCheckResult(null);
     setAuditRows([]);
+    setMetricsSummary(null);
+    setMetricsDaily([]);
+    setMetricsAgents([]);
     setApplicationEvents([]);
     setTrackedApplicationsTotal(0);
     setIntegrityTrail([]);
@@ -2141,10 +2410,25 @@ export default function App() {
   );
 
   const refreshGlobal = useCallback(async () => {
-    const [nextStates, nextAppsPage, nextHealth, nextEvents, nextTools, nextResources] = await Promise.all([
+    const [
+      nextStates,
+      nextAppsPage,
+      nextHealth,
+      nextDeliveryHealth,
+      nextMetricsSummary,
+      nextMetricsDaily,
+      nextMetricsAgents,
+      nextEvents,
+      nextTools,
+      nextResources,
+    ] = await Promise.all([
       fetchApplicationStates(),
       fetchAllApplications(200),
       fetchLedgerHealth(),
+      fetchDeliveryHealth(),
+      fetchMetricsSummary(analyticsWindow),
+      fetchMetricsDaily(analyticsWindow),
+      fetchMetricsAgents(analyticsWindow),
       fetchRecentEvents(60),
       fetchTools(),
       fetchResources()
@@ -2154,6 +2438,10 @@ export default function App() {
     setApplications(nextAppsPage.items);
     setTrackedApplicationsTotal(nextAppsPage.total);
     setHealth(nextHealth);
+    setDeliveryHealth(nextDeliveryHealth);
+    setMetricsSummary(nextMetricsSummary);
+    setMetricsDaily(nextMetricsDaily);
+    setMetricsAgents(nextMetricsAgents);
     setRecentEvents(nextEvents);
     setToolDefinitions(nextTools);
     setResourceDefinitions(nextResources);
@@ -2172,7 +2460,7 @@ export default function App() {
     }
 
     setLastRefresh(new Date().toISOString());
-  }, [applicationId, authUser?.role, canViewAudit, selectedTool]);
+  }, [analyticsWindow, applicationId, authUser?.role, canViewAudit, selectedTool]);
 
   const loadEverything = useCallback(async () => {
     if (!authUser) {
@@ -2214,9 +2502,8 @@ export default function App() {
     if (!authUser) {
       return;
     }
-    setWorkspaceMode("operations");
-    setAllEvidencePanels(false);
-  }, [authUser, setAllEvidencePanels]);
+    collapseEvidencePanels();
+  }, [authUser, collapseEvidencePanels]);
 
   useEffect(() => {
     if (!authUser) {
@@ -2263,10 +2550,8 @@ export default function App() {
   }, [applicationId, eventActorFilter, eventTimeRange, eventTypeFilter]);
 
   useEffect(() => {
-    if (workspaceMode === "operations") {
-      setAllEvidencePanels(false);
-    }
-  }, [applicationId, setAllEvidencePanels, workspaceMode]);
+    collapseEvidencePanels();
+  }, [applicationId, collapseEvidencePanels]);
 
   useEffect(() => {
     if (!notice) {
@@ -2729,14 +3014,6 @@ export default function App() {
 
           <div className="identity-meta">
             <div className="identity-meta-top">
-              <div className="badge-row">
-                <StatusBadge label="Internal" tone="neutral" />
-                <StatusBadge label="RBAC active" tone="ok" />
-                <StatusBadge
-                  label={`Projection ${projectionSummary.label}`}
-                  tone={projectionSummary.tone}
-                />
-              </div>
               <div className="meta-actions meta-actions-inline">
                 <button className="button subtle button-compact" onClick={() => void loadEverything()} disabled={busy}>
                   Refresh
@@ -2747,10 +3024,6 @@ export default function App() {
               </div>
             </div>
             <div className="meta-strip">
-              <div className="meta-item meta-item-inline">
-                <span className="meta-label">System status</span>
-                <strong>{projectionSummary.label}</strong>
-              </div>
               <div className="meta-item meta-item-inline">
                 <span className="meta-label">Last refresh</span>
                 <strong>{prettyDate(lastRefresh)}</strong>
@@ -2783,13 +3056,6 @@ export default function App() {
             tone="neutral"
           />
           <MetricTile
-            label="Projection Health"
-            value={projectionSummary.label}
-            detail={projectionSummary.detail}
-            tone={projectionSummary.tone}
-          />
-          <MetricTile label="Integrity" value={integritySummary.status} detail={integritySummary.verifiedWindow} tone={integritySummary.tone} />
-          <MetricTile
             label="Compliance Exceptions"
             value={`${openComplianceIssues}`}
             detail={
@@ -2802,63 +3068,6 @@ export default function App() {
         </section>
 
         <AgentPipelineFlow stages={pipelineStages} compact />
-
-        <section className="panel workspace-nav workspace-strip">
-          <div className="workspace-strip-main">
-            <p className="section-kicker">Workspace</p>
-            <h2
-              title={
-                isOperationsView
-                  ? "Operational view for focused applications, command execution, and pipeline progress."
-                  : isAuditView
-                    ? "Audit view for evidence, verification, and temporal reconstruction."
-                    : "System view for projections, MCP resources, and session replay."
-              }
-            >
-              The Ledger Workspace
-            </h2>
-          </div>
-          <div className="workspace-controls">
-            <div className="workspace-tabs" role="tablist" aria-label="Ledger views">
-              {(["operations", "audit", "system"] as WorkspaceMode[]).map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  role="tab"
-                  aria-selected={workspaceMode === tab}
-                  className={`tab-button ${workspaceMode === tab ? "active" : ""}`}
-                  onClick={() => {
-                    setWorkspaceMode(tab);
-                    if (tab !== "audit") {
-                      setAllEvidencePanels(false);
-                    }
-                  }}
-                >
-                  {titleize(tab)}
-                </button>
-              ))}
-            </div>
-            {isAuditView ? (
-              <button
-                className="button subtle evidence-toggle"
-                type="button"
-                onClick={() => setAllEvidencePanels(!allEvidenceExpanded)}
-              >
-                {allEvidenceExpanded ? "Collapse all evidence" : "Expand all evidence"}
-              </button>
-            ) : (
-              <button
-                className="button subtle evidence-toggle workspace-action-placeholder"
-                type="button"
-                disabled
-                tabIndex={-1}
-                aria-hidden="true"
-              >
-                Expand all evidence
-              </button>
-            )}
-          </div>
-        </section>
 
         <FocusedRecordSummary
           application={application}
@@ -2883,740 +3092,115 @@ export default function App() {
               onCommandPayloadChange={setCommandPayload}
               commandResult={commandResult}
             />
-
-            <section className="panel panel-support">
-              <div className="panel-heading">
-                <div>
-                  <p className="section-kicker">Role-Scoped Access</p>
-                  <h2>Operator entitlements</h2>
-                </div>
-              </div>
-
-              <div className="definition-list compact">
-                <div>
-                  <span>Role</span>
-                  <strong>{titleize(authUser.role)}</strong>
-                </div>
-                <div>
-                  <span>Command entitlements</span>
-                  <strong>{authUser.allowed_commands.length}</strong>
-                </div>
-                <div>
-                  <span>Auth audit visibility</span>
-                  <strong>{canViewAudit ? "Granted" : "Restricted"}</strong>
-                </div>
-                <div>
-                  <span>Active tab</span>
-                  <strong>{titleize(workspaceMode)}</strong>
-                </div>
-              </div>
-              <details className="detail-block">
-                <summary>Allowed commands</summary>
-                <div className="tag-list">
-                  {authUser.allowed_commands.map((command) => (
-                    <span className="role-chip" key={command}>
-                      {command}
-                    </span>
-                  ))}
-                </div>
-              </details>
-            </section>
+            <MCPResourcePanel
+              resourceUri={resourceUri}
+              onResourceUriChange={setResourceUri}
+              onInspectResource={(target) => void handleInspectResource(target)}
+              resourceBusy={resourceBusy}
+              resourceQuickPicks={resourceQuickPicks}
+              resourceHistory={resourceHistory}
+              resourceDefinitions={resourceDefinitions}
+              resourceResult={resourceResult}
+              className="sidebar-mcp"
+            />
           </aside>
 
           <main className="workspace-column center-column">
-            {isOperationsView ? (
-              <>
-                <section className="panel">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Application Snapshot</p>
-                      <h2>Focused application</h2>
-                    </div>
-                    <div className="focus-controls">
-                      <label>
-                        Agent ID
-                        <input
-                          value={agentId}
-                          onChange={(event) => setAgentId(event.target.value)}
-                          placeholder="credit-agent-ethi-01"
-                        />
-                      </label>
-                      <button className="button subtle" onClick={() => void refreshFocused()} disabled={busy}>
-                        Refresh focus
-                      </button>
-                    </div>
-                  </div>
+            <section className="workspace-story-section">
+              <DeliveryHealthPanel delivery={deliveryHealth} />
+            </section>
 
-                  {!application ? (
-                    <p className="empty-state">Select an application or run a governed lifecycle.</p>
-                  ) : (
-                    <div className="snapshot-grid">
-                      <div className="snapshot-main">
-                        <div className="snapshot-title-row">
-                          <div>
-                            <span className="meta-label">Application</span>
-                            <div className="record-id-row">
-                              <h3 title={application.application_id}>{shortId(application.application_id, 8)}</h3>
-                              <button
-                                type="button"
-                                className="button subtle copy-id-button"
-                                onClick={() => void handleCopyApplicationId(application.application_id)}
-                                title={application.application_id}
-                              >
-                                Copy ID
-                              </button>
-                            </div>
-                          </div>
-                          <StatusBadge label={titleize(application.current_state)} tone={toTone(application.current_state)} />
-                        </div>
+            <section className="workspace-story-section">
+              <div className="workspace-story-head">
+                <div>
+                  <p className="section-kicker">Audit</p>
+                  <h3>Decision evidence and traceability</h3>
+                </div>
+                <div className="workspace-story-actions">
+                  <p className="section-note">
+                    End-to-end event evidence, agent activity, and decision lineage for client review.
+                  </p>
+                  <button
+                    type="button"
+                    className="button subtle button-compact"
+                    onClick={() => toggleEvidencePanel("lineage")}
+                  >
+                    {evidencePanels.lineage ? "Collapse audit evidence" : "Expand audit evidence"}
+                  </button>
+                </div>
+              </div>
 
-                        <div className="definition-list compact">
-                          <div>
-                            <span>Requested (ETB)</span>
-                            <strong>{formatMoney(application.requested_amount_usd)}</strong>
-                          </div>
-                          <div>
-                            <span>Recommendation</span>
-                            <strong>{titleize(application.decision_recommendation ?? "Pending")}</strong>
-                          </div>
-                          <div>
-                            <span>Final decision</span>
-                            <strong>{titleize(application.final_decision ?? "Pending")}</strong>
-                          </div>
-                          <div>
-                            <span>Approved (ETB)</span>
-                            <strong>{formatMoney(application.approved_amount_usd)}</strong>
-                          </div>
-                          <div>
-                            <span>Max limit (ETB)</span>
-                            <strong>{formatMoney(application.assessed_max_limit_usd)}</strong>
-                          </div>
-                          <div>
-                            <span>Compliance posture</span>
-                            <strong>{titleize(application.compliance_status ?? "Not started")}</strong>
-                          </div>
-                        </div>
-                      </div>
+              <AuditPhaseTimeline
+                timelineGroups={timelineGroups}
+                collapsedTimelineGroups={collapsedTimelineGroups}
+                onToggleGroup={(key, nextValue) =>
+                  setCollapsedTimelineGroups((current) => ({ ...current, [key]: nextValue }))
+                }
+                eventTypeFilter={eventTypeFilter}
+                onEventTypeFilterChange={setEventTypeFilter}
+                lineageEventTypes={lineageEventTypes}
+                eventActorFilter={eventActorFilter}
+                onEventActorFilterChange={setEventActorFilter}
+                lineageActors={lineageActors}
+                eventTimeRange={eventTimeRange}
+                onEventTimeRangeChange={setEventTimeRange}
+                onResetFilters={() => {
+                  setEventTypeFilter("all");
+                  setEventActorFilter("all");
+                  setEventTimeRange("all");
+                }}
+                filteredCount={filteredLineage.length}
+                applicationId={applicationId}
+                showMetadata={evidencePanels.lineage}
+              />
+              <EventCoveragePanel
+                applicationId={applicationId.trim()}
+                observedEventTypes={lineageEventTypes}
+              />
+            </section>
 
-                      <div className="snapshot-side">
-                        <div className="side-card">
-                          <span className="meta-label">Event evidence</span>
-                          <strong>{titleize(application.last_event_type)}</strong>
-                          <p>Global #{application.last_global_position}</p>
-                        </div>
-                        <div className="side-card">
-                          <span className="meta-label">Projection update</span>
-                          <strong>{prettyDate(application.updated_at)}</strong>
-                          <p>State derived from immutable events.</p>
-                        </div>
-                        <div className="side-card">
-                          <span className="meta-label">Compliance posture</span>
-                          <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Not available")}</strong>
-                          <p>Regulation set {readString(currentComplianceSnapshot.regulation_set_version) ?? "Not set"}</p>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </section>
+            <section className="workspace-story-section">
+              <div className="workspace-story-head">
+                <div>
+                  <p className="section-kicker">System</p>
+                  <h3>Projection and resource readiness</h3>
+                </div>
+                <p className="section-note">
+                  Platform health, projection readiness, and MCP resource access in one place.
+                </p>
+              </div>
 
-                <section className="panel">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Tracked Pipeline</p>
-                      <h2>Application register</h2>
-                    </div>
-                    <p className="section-note">
-                      {visibleApplicationRows.length} rows in view of {trackedApplicationsTotal}
-                    </p>
-                  </div>
-
-                  <div className="application-list">
-                    <div className="list-head">
-                      <span>Application</span>
-                      <span>Pipeline</span>
-                      <span>Compliance</span>
-                    </div>
-                    {visibleApplicationRows.map((item) => {
-                      const isFocused = application?.application_id === item.application_id;
-                      const isDimmed = Boolean(application?.application_id) && !isFocused;
-                      return (
-                        <button
-                          key={item.application_id}
-                          className={`application-row ${isFocused ? "active" : ""} ${isDimmed ? "dimmed" : ""}`}
-                          onClick={() => void handleSelectApplication(item.application_id)}
-                        >
-                          <div>
-                            <strong title={item.application_id}>{shortId(item.application_id, 8)}</strong>
-                            <span>Commercial application</span>
-                          </div>
-                          <div>
-                            <strong>{titleize(item.current_state)}</strong>
-                            <span>{prettyDate(item.updated_at)}</span>
-                          </div>
-                          <div className="row-end">
-                            <StatusBadge
-                              label={titleize(item.compliance_status ?? "Not started")}
-                              tone={toTone(item.compliance_status)}
-                            />
-                            <span className="row-muted">{isFocused ? "Focused" : "Select"}</span>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
-              </>
-            ) : null}
-
-            {isAuditView ? (
-              <>
-                <AuditPhaseTimeline
-                  timelineGroups={timelineGroups}
-                  collapsedTimelineGroups={collapsedTimelineGroups}
-                  onToggleGroup={(key, nextValue) =>
-                    setCollapsedTimelineGroups((current) => ({ ...current, [key]: nextValue }))
-                  }
-                  eventTypeFilter={eventTypeFilter}
-                  onEventTypeFilterChange={setEventTypeFilter}
-                  lineageEventTypes={lineageEventTypes}
-                  eventActorFilter={eventActorFilter}
-                  onEventActorFilterChange={setEventActorFilter}
-                  lineageActors={lineageActors}
-                  eventTimeRange={eventTimeRange}
-                  onEventTimeRangeChange={setEventTimeRange}
-                  onResetFilters={() => {
-                    setEventTypeFilter("all");
-                    setEventActorFilter("all");
-                    setEventTimeRange("all");
-                  }}
-                  filteredCount={filteredLineage.length}
-                  applicationId={applicationId}
-                  showMetadata={evidencePanels.lineage}
-                  onToggleMetadata={() => toggleEvidencePanel("lineage")}
-                />
-                <EventCoveragePanel
-                  applicationId={applicationId.trim()}
-                  observedEventTypes={lineageEventTypes}
-                />
-              </>
-            ) : null}
-
-            {isSystemView ? (
-              <>
-                <ProjectionHealthPanel rows={projectionStatusRows} />
-                <MCPResourcePanel
-                  resourceUri={resourceUri}
-                  onResourceUriChange={setResourceUri}
-                  onInspectResource={(target) => void handleInspectResource(target)}
-                  resourceBusy={resourceBusy}
-                  resourceQuickPicks={resourceQuickPicks}
-                  resourceHistory={resourceHistory}
-                  resourceDefinitions={resourceDefinitions}
-                  resourceResult={resourceResult}
-                />
-              </>
-            ) : null}
+              <ProjectionHealthPanel rows={projectionStatusRows} />
+            </section>
           </main>
 
           <aside className="workspace-column right-column">
-            {isOperationsView ? (
-              <>
-                <section className="panel panel-support">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Compliance Posture</p>
-                      <h2>Current status</h2>
-                    </div>
-                  </div>
+            <ClientAnalyticsPanel
+              summary={metricsSummary}
+              daily={metricsDaily}
+              agents={metricsAgents}
+              selectedWindow={analyticsWindow}
+              onWindowChange={setAnalyticsWindow}
+              className="sidebar-analytics"
+            />
 
-                  {compliance ? (
-                    <div className="definition-list compact">
-                      <div>
-                        <span>Status</span>
-                        <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Unknown")}</strong>
-                      </div>
-                      <div>
-                        <span>Regulation set</span>
-                        <strong>{readString(currentComplianceSnapshot.regulation_set_version) ?? "Unavailable"}</strong>
-                      </div>
-                      <div>
-                        <span>Failed checks</span>
-                        <strong>{currentFailedChecks}</strong>
-                      </div>
-                      <div>
-                        <span>Projection updated</span>
-                        <strong>{prettyDate(readString(currentComplianceSnapshot.updated_at))}</strong>
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="empty-state">No compliance view for the current application.</p>
-                  )}
-                </section>
-
-                <IntegrityStatusCard
-                  title="Verification status"
-                  status={integritySummary.status}
-                  tone={integritySummary.tone}
-                  verified={integrityCoverage.verified}
-                  total={integrityCoverage.total || 0}
-                  evidenceHash={integritySummary.evidenceHash}
-                  verifiedAt={integritySummary.verifiedAt}
-                  verifiedWindow={integritySummary.verifiedWindow}
-                  tamperState={integritySummary.tamperState}
-                  hasIntegrityCommand={hasIntegrityCommand}
-                  busy={busy}
-                  onRunVerification={() => void handleRunVerification()}
-                />
-              </>
-            ) : null}
-
-            {isAuditView ? (
-              <>
-                <IntegrityStatusCard
-                  title="Audit evidence"
-                  status={integritySummary.status}
-                  tone={integritySummary.tone}
-                  verified={integrityCoverage.verified}
-                  total={integrityCoverage.total || 0}
-                  evidenceHash={integritySummary.evidenceHash}
-                  verifiedAt={integritySummary.verifiedAt}
-                  verifiedWindow={integritySummary.verifiedWindow}
-                  tamperState={integritySummary.tamperState}
-                  hasIntegrityCommand={hasIntegrityCommand}
-                  busy={busy}
-                  onRunVerification={() => void handleRunVerification()}
-                  showEvidenceToggle
-                  evidenceExpanded={evidencePanels.integrity}
-                  onToggleEvidence={() => toggleEvidencePanel("integrity")}
-                />
-
-                <section className="panel temporal-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Temporal Replay</p>
-                      <h2>Regulatory reconstruction</h2>
-                    </div>
-                  </div>
-
-                  <div className="temporal-toolbar">
-                    <div className="temporal-inputs">
-                      <label>
-                        Application
-                        <input
-                          value={applicationId}
-                          onChange={(event) => setApplicationId(event.target.value)}
-                          placeholder="app-..."
-                        />
-                      </label>
-                      <label>
-                        As of
-                        <input
-                          type="datetime-local"
-                          value={temporalAsOf}
-                          onChange={(event) => setTemporalAsOf(event.target.value)}
-                        />
-                      </label>
-                    </div>
-                    <button
-                      className="button temporal-run"
-                      onClick={() => void handleTemporalInspect()}
-                      disabled={temporalBusy}
-                    >
-                      {temporalBusy ? "Reconstructing..." : "Run reconstruction"}
-                    </button>
-                  </div>
-
-                  <div className="checkpoint-list">
-                    {applicationLineage.length === 0 ? (
-                      <p className="empty-state">No checkpoints available for this application.</p>
-                    ) : (
-                      applicationLineage.slice(-replayCheckpointCount).map((item) => (
-                        <button
-                          className="checkpoint-button"
-                          key={item.key}
-                          onClick={() => setTemporalAsOf(toDateTimeLocalValue(item.recordedAt))}
-                        >
-                          <span className="checkpoint-event" title={titleize(item.eventType)}>
-                            {titleize(item.eventType)}
-                          </span>
-                          <span className="checkpoint-time">{prettyDateCompact(item.recordedAt)}</span>
-                        </button>
-                      ))
-                    )}
-                  </div>
-
-                  <div className="temporal-summary">
-                    <div className="comparison-grid">
-                      <div>
-                        <span>Current posture</span>
-                        <strong>
-                          {titleize(
-                            application?.compliance_status ??
-                              readString(currentComplianceSnapshot.compliance_status) ??
-                              "NOT_STARTED"
-                          )}
-                        </strong>
-                      </div>
-                      <div>
-                        <span>Historical posture</span>
-                        <strong>{titleize(readString(temporalSnapshot.compliance_status) ?? "Not loaded")}</strong>
-                      </div>
-                      <div>
-                        <span>Failed checks now</span>
-                        <strong>{currentFailedChecks}</strong>
-                      </div>
-                      <div>
-                        <span>Failed checks then</span>
-                        <strong>{temporalFailedChecks}</strong>
-                      </div>
-                    </div>
-                    <strong className="temporal-delta">{temporalDelta}</strong>
-                    <div className="definition-list compact">
-                      <div>
-                        <span>As of</span>
-                        <strong>{temporalAsOf ? prettyDate(fromDateTimeLocalValue(temporalAsOf)) : "Not set"}</strong>
-                      </div>
-                      <div>
-                        <span>Application</span>
-                        <strong>{applicationId || "Not set"}</strong>
-                      </div>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="panel panel-raw-activity">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Recent Activity</p>
-                      <h2>Latest append stream</h2>
-                    </div>
-                    <div className="panel-actions">
-                      <p className="section-note">Raw append order from the ledger.</p>
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => toggleEvidencePanel("activity")}
-                      >
-                        {evidencePanels.activity ? "Hide evidence" : "Show evidence"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {visibleActivity.length === 0 ? (
-                    <p className="empty-state">No ledger events available for this scope.</p>
-                  ) : (
-                    <div className="activity-table">
-                      <div className="list-head">
-                        <span>Event</span>
-                        <span>Application</span>
-                        <span>Lane</span>
-                      </div>
-                      {visibleActivity.map((event) => {
-                        const payload = readRecord(event.payload);
-                        const metadata = readRecord(event.metadata);
-                        const rowApplicationId = readString(payload.application_id);
-                        return (
-                          <article className="event-row-wrap" key={event.event_id}>
-                            <button
-                              className="activity-row"
-                              onClick={() => {
-                                const nextApplicationId = readString(payload.application_id);
-                                if (nextApplicationId) {
-                                  void handleSelectApplication(nextApplicationId);
-                                }
-                              }}
-                            >
-                              <div>
-                                <strong title={titleize(event.event_type)}>{titleize(event.event_type)}</strong>
-                                <span title={actorForEvent(event.event_type, payload, metadata)}>
-                                  {actorForEvent(event.event_type, payload, metadata)}
-                                </span>
-                              </div>
-                              <div>
-                                <strong title={rowApplicationId ?? "Unlinked event"}>
-                                  {!rowApplicationId ? "Unlinked event" : shortId(rowApplicationId, 8)}
-                                </strong>
-                                <span title={prettyDate(event.recorded_at)}>{prettyDateCompact(event.recorded_at)}</span>
-                              </div>
-                              <div>
-                                <strong title={titleize(laneForEvent(event.event_type))}>
-                                  {titleize(laneForEvent(event.event_type))}
-                                </strong>
-                                <span>Pos #{event.global_position}</span>
-                              </div>
-                            </button>
-                            {evidencePanels.activity ? (
-                              <div className="evidence-inline">
-                                <span className="meta-label">Event IDs</span>
-                                <div className="lineage-evidence">
-                                  <span>Application {rowApplicationId ?? "Unlinked event"}</span>
-                                  <span>Stream {event.stream_id}</span>
-                                  <span>Event {shortId(event.event_id)}</span>
-                                  <span>Global #{event.global_position}</span>
-                                </div>
-                              </div>
-                            ) : null}
-                          </article>
-                        );
-                      })}
-                    </div>
-                  )}
-                </section>
-
-                <section className="panel panel-support">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Compliance Posture</p>
-                      <h2>Current regulatory state</h2>
-                    </div>
-                    <div className="panel-actions">
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => toggleEvidencePanel("compliance")}
-                      >
-                        {evidencePanels.compliance ? "Hide evidence" : "Show evidence"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {compliance ? (
-                    <>
-                      <div className="definition-list compact">
-                        <div>
-                          <span>Status</span>
-                          <strong>{titleize(readString(currentComplianceSnapshot.compliance_status) ?? "Unknown")}</strong>
-                        </div>
-                        <div>
-                          <span>Regulation set</span>
-                          <strong>{readString(currentComplianceSnapshot.regulation_set_version) ?? "Unavailable"}</strong>
-                        </div>
-                        <div>
-                          <span>Mandatory checks</span>
-                          <strong>{readStringList(currentComplianceSnapshot.mandatory_checks).length}</strong>
-                        </div>
-                        <div>
-                          <span>Passed checks</span>
-                          <strong>{readStringList(currentComplianceSnapshot.passed_checks).length}</strong>
-                        </div>
-                        <div>
-                          <span>Failed checks</span>
-                          <strong>{currentFailedChecks}</strong>
-                        </div>
-                        <div>
-                          <span>Projection updated</span>
-                          <strong>{prettyDate(readString(currentComplianceSnapshot.updated_at))}</strong>
-                        </div>
-                      </div>
-
-                      {evidencePanels.compliance ? (
-                        <div className="evidence-block">
-                          <span className="meta-label">Compliance event evidence</span>
-                          <div className="mini-timeline">
-                            {compliance.timeline.slice(-6).map((entry) => {
-                              const evidenceStatus = complianceEvidenceStatus(entry);
-                              return (
-                                <article className="mini-timeline-row" key={`${entry.global_position}-${entry.event_type}`}>
-                                  <div>
-                                    <strong>{titleize(entry.event_type)}</strong>
-                                    <span>
-                                      {entry.rule_id
-                                        ? `${entry.rule_id} · ${entry.rule_version ?? "active"}`
-                                        : "Policy evaluation"}
-                                    </span>
-                                  </div>
-                                  <div>
-                                    <strong className={`tone-${evidenceStatus.tone}`}>{evidenceStatus.label}</strong>
-                                    <span>{prettyDate(entry.recorded_at)}</span>
-                                  </div>
-                                </article>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      ) : null}
-                    </>
-                  ) : (
-                    <p className="empty-state">No compliance view for the current application.</p>
-                  )}
-                </section>
-
-                <section className="panel panel-support">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Audit Access</p>
-                      <h2>Authentication evidence</h2>
-                    </div>
-                    <p className="section-note">Latest 10 policy outcomes</p>
-                  </div>
-
-                  {canViewAudit ? (
-                    <div className="activity-table compact">
-                      <div className="list-head">
-                        <span>Action</span>
-                        <span>Outcome</span>
-                        <span>Recorded</span>
-                      </div>
-                      {auditRows.slice(0, 10).map((row) => {
-                        const outcome = presentAuditOutcome(row);
-                        return (
-                          <div className="activity-row static audit-row" key={row.audit_id}>
-                            <div>
-                              <strong>{presentAuditAction(row.action)}</strong>
-                              <span>{row.username ?? "anonymous"}</span>
-                            </div>
-                            <div>
-                              <StatusBadge label={outcome.label} tone={outcome.tone} />
-                              <span>{outcome.helper}</span>
-                            </div>
-                            <div>
-                              <strong>{prettyDate(row.created_at)}</strong>
-                              <span>{row.ip_address ?? "IP unavailable"}</span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <p className="empty-state">Role-scoped access: auth audit log restricted.</p>
-                  )}
-                </section>
-              </>
-            ) : null}
-
-            {isSystemView ? (
-              <>
-                <section className="panel">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Agent Session Resource</p>
-                      <h2>Session replay</h2>
-                    </div>
-                    <p className="section-note">Replay a selected agent session from the ledger.</p>
-                  </div>
-
-                  <div className="definition-list compact">
-                    <div>
-                      <span>Agent</span>
-                      <strong>{agentId || "Not set"}</strong>
-                    </div>
-                    <div>
-                      <span>Discovered sessions</span>
-                      <strong>{sessionCandidates.length}</strong>
-                    </div>
-                  </div>
-
-                  <label>
-                    Session ID
-                    <input
-                      value={sessionIdInput}
-                      onChange={(event) => setSessionIdInput(event.target.value)}
-                      placeholder="session-..."
-                      list="session-candidate-list"
-                    />
-                    <datalist id="session-candidate-list">
-                      {sessionCandidates.map((candidate) => (
-                        <option key={candidate} value={candidate} />
-                      ))}
-                    </datalist>
-                  </label>
-
-                  <div className="quick-actions">
-                    <button className="button" onClick={() => void handleLoadSessionReplay()} disabled={sessionReplayBusy}>
-                      {sessionReplayBusy ? "Loading session..." : "Load session replay"}
-                    </button>
-                    {sessionCandidates.length > 0 ? (
-                      <button
-                        className="button subtle"
-                        onClick={() => setSessionIdInput(sessionCandidates[0])}
-                        type="button"
-                      >
-                        Use latest discovered session
-                      </button>
-                    ) : null}
-                  </div>
-
-                  {!sessionReplay ? (
-                    <p className="empty-state">Choose a session to load replay evidence.</p>
-                  ) : (
-                    <>
-                      <div className="definition-list compact session-summary">
-                        <div>
-                          <span>Loaded session</span>
-                          <strong>{sessionIdInput || "Not set"}</strong>
-                        </div>
-                        <div>
-                          <span>Stream</span>
-                          <strong>{sessionReplay.stream_id}</strong>
-                        </div>
-                        <div>
-                          <span>Events</span>
-                          <strong>{sessionReplay.events.length}</strong>
-                        </div>
-                      </div>
-                      <div className="activity-table compact">
-                        <div className="list-head">
-                          <span>Event</span>
-                          <span>Position</span>
-                          <span>Recorded</span>
-                        </div>
-                        {[...sessionReplay.events]
-                          .slice(-8)
-                          .reverse()
-                          .map((event) => (
-                            <div className="activity-row static" key={event.event_id}>
-                              <div>
-                                <strong>{titleize(event.event_type)}</strong>
-                                <span>{actorForEvent(event.event_type, readRecord(event.payload), readRecord(event.metadata))}</span>
-                              </div>
-                              <div>
-                                <strong>#{event.stream_position}</strong>
-                                <span>Global #{event.global_position}</span>
-                              </div>
-                              <div>
-                                <strong>{prettyDate(event.recorded_at)}</strong>
-                                <span>{shortId(event.event_id)}</span>
-                              </div>
-                            </div>
-                          ))}
-                      </div>
-                    </>
-                  )}
-                </section>
-
-                <section className="panel panel-support">
-                  <div className="panel-heading">
-                    <div>
-                      <p className="section-kicker">Model Oversight</p>
-                      <h2>Agent performance</h2>
-                    </div>
-                  </div>
-
-                  {!agentPerformance || agentPerformance.models.length === 0 ? (
-                    <p className="empty-state">No model projection for the current agent.</p>
-                  ) : (
-                    <div className="activity-table compact">
-                      {agentPerformance.models.map((model) => (
-                        <div className="activity-row static" key={`${model.agent_id}-${model.model_version}`}>
-                          <div>
-                            <strong>{model.model_version}</strong>
-                            <span>{model.agent_id}</span>
-                          </div>
-                          <div>
-                            <strong>{model.analyses_completed} analyses</strong>
-                            <span>{model.fraud_screenings_completed} fraud screenings</span>
-                          </div>
-                          <div>
-                            <strong>{model.avg_confidence_score.toFixed(2)}</strong>
-                            <span>{model.decisions_recorded} decisions</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </section>
-              </>
-            ) : null}
+            <IntegrityStatusCard
+              title="Ledger integrity"
+              status={integritySummary.status}
+              tone={integritySummary.tone}
+              verified={integrityCoverage.verified}
+              total={integrityCoverage.total || 0}
+              evidenceHash={integritySummary.evidenceHash}
+              verifiedAt={integritySummary.verifiedAt}
+              verifiedWindow={integritySummary.verifiedWindow}
+              tamperState={integritySummary.tamperState}
+              hasIntegrityCommand={hasIntegrityCommand}
+              busy={busy}
+              onRunVerification={() => void handleRunVerification()}
+              showEvidenceToggle
+              evidenceExpanded={evidencePanels.integrity}
+              onToggleEvidence={() => toggleEvidencePanel("integrity")}
+            />
           </aside>
         </div>
 

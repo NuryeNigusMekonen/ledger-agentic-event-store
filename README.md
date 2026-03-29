@@ -260,6 +260,99 @@ Run continuously:
 make outbox-relay
 ```
 
+### Kafka Delivery Mode
+
+Relay can publish directly to Kafka (for analytics and downstream integrations):
+
+Start local Kafka with Docker (now includes an auto-running outbox relay container):
+
+```bash
+make kafka-start
+```
+
+Check running containers:
+
+```bash
+make kafka-status
+```
+
+Stop Kafka:
+
+```bash
+make kafka-stop
+```
+
+Stop Kafka and remove volumes:
+
+```bash
+make kafka-stop ARGS="--purge"
+```
+
+If relay cannot connect to Postgres from Docker, set:
+
+```bash
+export OUTBOX_RELAY_DATABASE_URL="postgresql://<user>:<password>@host.docker.internal:55432/<db>"
+```
+
+Then run `make kafka-start` again.
+
+View relay logs:
+
+```bash
+docker compose -f docker-compose.kafka.yml logs -f outbox-relay
+```
+
+```bash
+OUTBOX_PUBLISHER=kafka KAFKA_BOOTSTRAP_SERVERS=localhost:9092 make outbox-relay
+```
+
+Or with explicit script args:
+
+```bash
+python scripts/run_outbox_relay.py --publisher kafka --kafka-bootstrap-servers localhost:9092
+```
+
+Dashboard now exposes delivery health at `GET /api/v1/ledger/delivery` and includes:
+- pending/retrying/dead-letter counts
+- publish throughput (5m and 1h)
+- per-topic delivery snapshot
+- configured transport mode (`sink` or `kafka`)
+
+Client analytics endpoint is also available at `GET /api/v1/analytics/summary`, powering:
+- window-based approval rate and turnaround KPIs
+- window-based funnel (submitted -> analyzed -> compliance -> decision -> finalized)
+- compliance failure hotspots (top failed rules)
+- human override rate
+- orchestrator agent decision leaderboard
+
+Projection-first chart APIs are available at:
+- `GET /api/v1/metrics/summary?window_days=30`
+- `GET /api/v1/metrics/daily?window_days=30`
+- `GET /api/v1/metrics/agents?window_days=30`
+
+These endpoints read from `client_analytics_projection` (not raw events) and power:
+- KPI cards (submitted, approval rate, average processing time, finalized)
+- daily trend line chart (submitted vs approved)
+- approval split pie chart (approved vs declined)
+- agent decision volume bar chart
+- daily processing-time line chart
+
+`window_days` is supported with strict values `7`, `30`, or `90`:
+
+```bash
+curl -sS "http://127.0.0.1:8000/api/v1/analytics/summary?window_days=90" \
+  -H "authorization: Bearer <token>"
+```
+
+Dashboard analytics panel includes:
+- 7d/30d/90d switch
+- chart-based layout optimized for client readability
+
+When `make kafka-start` is used:
+- Kafka broker: `localhost:9092`
+- Kafka UI: `http://localhost:8085`
+- Outbox relay: `ledger-outbox-relay` (publishes to Kafka continuously)
+
 ## Week 3 Refinery Integration
 
 This repo now includes a full local **Document Intelligence Refinery** pipeline under `src/refinery/`:
