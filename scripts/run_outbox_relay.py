@@ -17,19 +17,37 @@ if str(ROOT_DIR) not in sys.path:
 
 async def _run(args: argparse.Namespace) -> None:
     from src.event_store import EventStore
-    from src.outbox import OutboxRelay, PostgresOutboxSinkPublisher
+    from src.outbox import KafkaOutboxPublisher, OutboxRelay, PostgresOutboxSinkPublisher
 
     dsn = args.database_url or os.getenv("DATABASE_URL")
     if not dsn:
         raise RuntimeError("DATABASE_URL is required (or pass --database-url).")
 
     store = await EventStore.from_dsn(dsn, min_size=1, max_size=8)
+    publisher = None
     try:
         if args.apply_schema:
             await store.apply_schema(ROOT_DIR / "src" / "schema.sql")
 
-        publisher = PostgresOutboxSinkPublisher(store)
-        await publisher.ensure_schema()
+        if args.publisher == "kafka":
+            if not args.kafka_bootstrap_servers:
+                raise RuntimeError(
+                    "Kafka publisher requires --kafka-bootstrap-servers "
+                    "(or KAFKA_BOOTSTRAP_SERVERS env var)."
+                )
+            publisher = KafkaOutboxPublisher(
+                bootstrap_servers=args.kafka_bootstrap_servers,
+                client_id=args.kafka_client_id,
+                compression_type=args.kafka_compression_type,
+            )
+        else:
+            sink_publisher = PostgresOutboxSinkPublisher(store)
+            await sink_publisher.ensure_schema()
+            publisher = sink_publisher
+
+        publisher_start = getattr(publisher, "start", None)
+        if callable(publisher_start):
+            await publisher_start()
 
         relay = OutboxRelay(
             store=store,
@@ -59,6 +77,10 @@ async def _run(args: argparse.Namespace) -> None:
 
         await relay.run_forever(poll_interval=args.poll_interval)
     finally:
+        if publisher is not None:
+            publisher_stop = getattr(publisher, "stop", None)
+            if callable(publisher_stop):
+                await publisher_stop()
         await store.close()
 
 
@@ -76,6 +98,16 @@ def main() -> None:
         "--once",
         action="store_true",
         help="Process one batch and exit.",
+    )
+    parser.add_argument(
+        "--publisher",
+        type=str,
+        choices=["sink", "kafka"],
+        default=os.getenv("OUTBOX_PUBLISHER", "sink"),
+        help=(
+            "Outbox publisher target. Use 'sink' for local validation or "
+            "'kafka' for broker delivery."
+        ),
     )
     parser.add_argument(
         "--apply-schema",
@@ -117,6 +149,24 @@ def main() -> None:
         type=float,
         default=30.0,
         help="How long a claimed message stays invisible to other workers.",
+    )
+    parser.add_argument(
+        "--kafka-bootstrap-servers",
+        type=str,
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", ""),
+        help="Comma-separated Kafka brokers (required when --publisher kafka).",
+    )
+    parser.add_argument(
+        "--kafka-client-id",
+        type=str,
+        default=os.getenv("KAFKA_CLIENT_ID", "ledger-outbox-relay"),
+        help="Kafka client id used by relay producer.",
+    )
+    parser.add_argument(
+        "--kafka-compression-type",
+        type=str,
+        default=os.getenv("KAFKA_COMPRESSION_TYPE") or None,
+        help="Optional Kafka compression type (gzip, snappy, lz4, zstd).",
     )
     args = parser.parse_args()
 

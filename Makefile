@@ -8,7 +8,7 @@ RUFF ?= .venv/bin/ruff
 NPM ?= npm
 WEB_DIR := apps/web
 
-.PHONY: help setup db-start db-stop db-status migrate api web web-install test test-api lint check backfill-integrity outbox-relay
+.PHONY: help setup db-start db-stop db-status migrate api web web-install test test-api lint check backfill-integrity outbox-relay kafka-start kafka-stop kafka-status
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*## "; print "Available targets:"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -53,3 +53,12 @@ backfill-integrity: ## Backfill integrity metadata (dry-run). Example: make back
 
 outbox-relay: ## Run outbox relay worker once. Example: make outbox-relay ARGS="--once"
 	$(PYTHON) scripts/run_outbox_relay.py $(ARGS)
+
+kafka-start: ## Start Kafka + Kafka UI + outbox relay via Docker Compose
+	bash scripts/kafka-start.sh
+
+kafka-stop: ## Stop Kafka + Kafka UI. Use ARGS="--purge" to delete volumes
+	bash scripts/kafka-stop.sh $(ARGS)
+
+kafka-status: ## Show Kafka Docker Compose status
+	bash scripts/kafka-status.sh

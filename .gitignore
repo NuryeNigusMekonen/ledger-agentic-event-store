@@ -11,6 +11,7 @@ challenge/
 .local/postgres/
 docs/
 report/
+demo/
 # Generated artifacts
 tmp/
 *.log
