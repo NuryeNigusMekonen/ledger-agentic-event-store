@@ -44,7 +44,7 @@ from src.models.events import (
     QualityAssessmentCompletedEvent,
     StoredEvent,
 )
-from src.refinery.pipeline import extract_financial_facts
+from src.refinery.pipeline import extract_financial_evidence
 
 
 @dataclass(slots=True)
@@ -56,6 +56,7 @@ class SubmitApplicationCommand:
     submission_channel: str
     submitted_at: datetime
     document_path: str | None = None
+    document_paths: list[str] = field(default_factory=list)
     process_documents_after_submit: bool = False
     correlation_id: str | None = None
     causation_id: str | None = None
@@ -164,22 +165,21 @@ class WriteCommandHandlers:
         # 1) Load
         stream_id = _loan_stream_id(command.application_id)
         loan = await LoanApplicationAggregate.load(self.store, stream_id)
+        normalized_paths = _normalize_document_paths(
+            document_path=command.document_path,
+            document_paths=command.document_paths,
+        )
 
         # 2) Validate
         if not loan.can_submit():
             raise DomainError(f"Application '{command.application_id}' already exists.")
         if command.requested_amount_usd <= 0:
             raise DomainError("requested_amount_usd must be positive.")
-        if command.process_documents_after_submit and not command.document_path:
+        if command.process_documents_after_submit and not normalized_paths:
             raise DomainError(
-                "process_documents_after_submit requires document_path."
+                "process_documents_after_submit requires document_path or document_paths."
             )
-        if command.document_path:
-            doc_path = Path(command.document_path)
-            if not doc_path.exists():
-                raise DomainError(f"document_path does not exist: {command.document_path}")
-            if not doc_path.is_file():
-                raise DomainError(f"document_path is not a file: {command.document_path}")
+        document_paths = _expand_document_paths(normalized_paths)
 
         # 3) Decide
         correlation_id = command.correlation_id or _new_correlation_id()
@@ -202,7 +202,7 @@ class WriteCommandHandlers:
                 ),
             )
         ]
-        if command.document_path:
+        for path in document_paths:
             decided_events.extend(
                 [
                     DocumentUploadRequestedEvent(
@@ -210,7 +210,7 @@ class WriteCommandHandlers:
                             "application_id": command.application_id,
                             "requested_at": requested_at,
                             "requested_by": command.applicant_id,
-                            "document_path": command.document_path,
+                            "document_path": path,
                         },
                         metadata=_metadata(
                             correlation_id,
@@ -223,7 +223,7 @@ class WriteCommandHandlers:
                             "application_id": command.application_id,
                             "uploaded_at": requested_at,
                             "uploaded_by": command.applicant_id,
-                            "document_path": command.document_path,
+                            "document_path": path,
                         },
                         metadata=_metadata(
                             correlation_id,
@@ -280,7 +280,7 @@ class WriteCommandHandlers:
 
         package_result = await self._append_document_package_events(
             application_id=command.application_id,
-            document_path=command.document_path or "",
+            document_paths=document_paths,
             correlation_id=correlation_id,
             causation_id=causation_id,
         )
@@ -331,58 +331,18 @@ class WriteCommandHandlers:
         self,
         *,
         application_id: str,
-        document_path: str,
+        document_paths: list[str],
         correlation_id: str,
         causation_id: str | None,
     ) -> AppendResult:
+        if not document_paths:
+            raise DomainError("document_paths must not be empty when processing document package.")
         doc_stream_id = _docpkg_stream_id(application_id)
         current_doc_events = await self.store.load_stream(doc_stream_id)
         current_version = len(current_doc_events)
-
-        facts = extract_financial_facts(document_path)
-        critical_fields = [
-            "total_revenue",
-            "net_income",
-            "ebitda",
-            "total_assets",
-            "total_liabilities",
-        ]
-        field_confidence = {
-            field: 1.0 if facts.get(field) is not None else 0.0 for field in critical_fields
-        }
-        critical_missing_fields = [
-            field for field, confidence in field_confidence.items() if confidence == 0.0
-        ]
-        extraction_notes = [field for field in critical_missing_fields]
-        confidence_values = list(field_confidence.values())
-        overall_confidence = (
-            sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
-        )
-
-        is_coherent = True
-        anomalies: list[str] = []
-        total_assets = facts.get("total_assets")
-        total_liabilities = facts.get("total_liabilities")
-        total_revenue = facts.get("total_revenue")
-        net_income = facts.get("net_income")
-        if (
-            total_assets is not None
-            and total_liabilities is not None
-            and total_assets < total_liabilities
-        ):
-            is_coherent = False
-            anomalies.append("assets_below_liabilities")
-        if (
-            total_revenue is not None
-            and net_income is not None
-            and abs(net_income) > total_revenue * 1.5
-        ):
-            anomalies.append("net_income_implausible_relative_to_revenue")
-
-        extension = Path(document_path).suffix.lower().lstrip(".") or "unknown"
-        now = datetime.now(UTC).isoformat()
         events: list[BaseEvent] = []
         if current_version == 0:
+            now = datetime.now(UTC).isoformat()
             events.append(
                 PackageCreatedEvent(
                     payload={
@@ -393,67 +353,118 @@ class WriteCommandHandlers:
                     metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
                 )
             )
-        events.extend(
-            [
-                DocumentAddedEvent(
-                    payload={
-                        "application_id": application_id,
-                        "document_path": document_path,
-                        "document_type": extension,
-                        "added_at": now,
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
-                DocumentFormatValidatedEvent(
-                    payload={
-                        "application_id": application_id,
-                        "document_path": document_path,
-                        "format": extension,
-                        "is_supported": True,
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
-                ExtractionStartedEvent(
-                    payload={
-                        "application_id": application_id,
-                        "document_path": document_path,
-                        "started_at": now,
-                        "pipeline": "document_refinery",
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
-                ExtractionCompletedEvent(
-                    payload={
-                        "application_id": application_id,
-                        "document_path": document_path,
-                        "facts": facts,
-                        "field_confidence": field_confidence,
-                        "extraction_notes": extraction_notes,
-                        "completed_at": now,
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
-                QualityAssessmentCompletedEvent(
-                    payload={
-                        "application_id": application_id,
-                        "overall_confidence": round(overall_confidence, 3),
-                        "is_coherent": is_coherent,
-                        "anomalies": anomalies,
-                        "critical_missing_fields": critical_missing_fields,
-                        "reextraction_recommended": len(critical_missing_fields) > 0,
-                        "auditor_notes": "Automated quality assessment completed.",
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
-                PackageReadyForAnalysisEvent(
-                    payload={
-                        "application_id": application_id,
-                        "package_id": application_id,
-                        "ready_at": now,
-                    },
-                    metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
-                ),
+
+        for document_path in document_paths:
+            extraction = extract_financial_evidence(document_path)
+            facts = extraction.facts
+            critical_fields = [
+                "total_revenue",
+                "net_income",
+                "ebitda",
+                "total_assets",
+                "total_liabilities",
             ]
+            field_confidence = {
+                field: 1.0 if facts.get(field) is not None else 0.0 for field in critical_fields
+            }
+            critical_missing_fields = [
+                field for field, confidence in field_confidence.items() if confidence == 0.0
+            ]
+            extraction_notes = [field for field in critical_missing_fields]
+            confidence_values = list(field_confidence.values())
+            overall_confidence = (
+                sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+            )
+
+            is_coherent = True
+            anomalies: list[str] = []
+            total_assets = facts.get("total_assets")
+            total_liabilities = facts.get("total_liabilities")
+            total_revenue = facts.get("total_revenue")
+            net_income = facts.get("net_income")
+            if (
+                total_assets is not None
+                and total_liabilities is not None
+                and total_assets < total_liabilities
+            ):
+                is_coherent = False
+                anomalies.append("assets_below_liabilities")
+            if (
+                total_revenue is not None
+                and net_income is not None
+                and abs(net_income) > total_revenue * 1.5
+            ):
+                anomalies.append("net_income_implausible_relative_to_revenue")
+
+            extension = Path(document_path).suffix.lower().lstrip(".") or "unknown"
+            now = datetime.now(UTC).isoformat()
+            events.extend(
+                [
+                    DocumentAddedEvent(
+                        payload={
+                            "application_id": application_id,
+                            "document_path": document_path,
+                            "document_type": extension,
+                            "added_at": now,
+                        },
+                        metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                    ),
+                    DocumentFormatValidatedEvent(
+                        payload={
+                            "application_id": application_id,
+                            "document_path": document_path,
+                            "format": extension,
+                            "is_supported": True,
+                        },
+                        metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                    ),
+                    ExtractionStartedEvent(
+                        payload={
+                            "application_id": application_id,
+                            "document_path": document_path,
+                            "started_at": now,
+                            "pipeline": "document_refinery",
+                        },
+                        metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                    ),
+                    ExtractionCompletedEvent(
+                        payload={
+                            "application_id": application_id,
+                            "document_path": document_path,
+                            "facts": facts,
+                            "fact_provenance": extraction.fact_provenance,
+                            "extraction_context": extraction.extraction_context,
+                            "field_confidence": field_confidence,
+                            "extraction_notes": extraction_notes,
+                            "completed_at": now,
+                        },
+                        metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                    ),
+                    QualityAssessmentCompletedEvent(
+                        payload={
+                            "application_id": application_id,
+                            "overall_confidence": round(overall_confidence, 3),
+                            "is_coherent": is_coherent,
+                            "anomalies": anomalies,
+                            "critical_missing_fields": critical_missing_fields,
+                            "reextraction_recommended": len(critical_missing_fields) > 0,
+                            "auditor_notes": "Automated quality assessment completed.",
+                        },
+                        metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+                    ),
+                ]
+            )
+
+        ready_at = datetime.now(UTC).isoformat()
+        events.append(
+            PackageReadyForAnalysisEvent(
+                payload={
+                    "application_id": application_id,
+                    "package_id": application_id,
+                    "ready_at": ready_at,
+                },
+                metadata=_metadata(correlation_id, actor_id="document-processing-agent"),
+            )
         )
 
         return await self.store.append(
@@ -1035,6 +1046,55 @@ def _compliance_stream_id(application_id: str) -> str:
 
 def _docpkg_stream_id(application_id: str) -> str:
     return f"docpkg-{application_id}"
+
+
+def _normalize_document_paths(
+    *,
+    document_path: str | None,
+    document_paths: list[str],
+) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    candidates: list[str] = []
+    if document_path:
+        candidates.append(document_path)
+    candidates.extend(document_paths)
+    for candidate in candidates:
+        normalized = str(candidate).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _expand_document_paths(paths: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        candidate = Path(path)
+        if not candidate.exists():
+            raise DomainError(f"document_path does not exist: {path}")
+        if candidate.is_file():
+            resolved_key = str(candidate.resolve())
+            if resolved_key in seen:
+                continue
+            seen.add(resolved_key)
+            ordered.append(str(candidate))
+            continue
+        if candidate.is_dir():
+            files = sorted(item for item in candidate.rglob("*") if item.is_file())
+            if not files:
+                raise DomainError(f"document directory has no files: {path}")
+            for file_path in files:
+                resolved_key = str(file_path.resolve())
+                if resolved_key in seen:
+                    continue
+                seen.add(resolved_key)
+                ordered.append(str(file_path))
+            continue
+        raise DomainError(f"document_path is not a file or directory: {path}")
+    return ordered
 
 
 def _audit_stream_id(entity_type: str, entity_id: str) -> str:

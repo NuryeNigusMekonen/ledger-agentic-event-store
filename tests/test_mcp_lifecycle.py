@@ -287,10 +287,131 @@ async def test_submit_application_can_process_document_and_emit_docpkg_events(
     )
     assert extraction_event.payload["facts"]["total_revenue"] == 1250000.0
     assert extraction_event.payload["facts"]["net_income"] == 210000.0
+    assert extraction_event.payload["fact_provenance"]["total_revenue"]["page_number"] == 1
+    assert extraction_event.payload["extraction_context"]["domain_hint"] == "financial"
+    assert extraction_event.payload["extraction_context"]["strategy_used"]
 
     loan_events = await server.store.load_stream(f"loan-{app_id}")
     assert any(event.event_type == "CreditAnalysisRequested" for event in loan_events)
 
+
+@pytest.mark.asyncio
+async def test_submit_application_can_process_multiple_documents(
+    server: LedgerMCPServer,
+    tmp_path: Path,
+) -> None:
+    app_id = f"app-{uuid4()}"
+    first_document = tmp_path / "application_financials_1.txt"
+    second_document = tmp_path / "application_financials_2.txt"
+    first_document.write_text(
+        (
+            "Total Revenue: 1250000\n"
+            "Net Income: 210000\n"
+            "EBITDA: 320000\n"
+            "Total Assets: 4500000\n"
+            "Total Liabilities: 1700000\n"
+        ),
+        encoding="utf-8",
+    )
+    second_document.write_text(
+        (
+            "Total Revenue: 980000\n"
+            "Net Income: 160000\n"
+            "EBITDA: 250000\n"
+            "Total Assets: 3900000\n"
+            "Total Liabilities: 1400000\n"
+        ),
+        encoding="utf-8",
+    )
+
+    submit_result = await server.call_tool(
+        "submit_application",
+        {
+            "application_id": app_id,
+            "applicant_id": "customer-xyz",
+            "requested_amount_usd": 12000,
+            "loan_purpose": "fleet purchase",
+            "submission_channel": "portal",
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "document_paths": [str(first_document), str(second_document)],
+            "process_documents_after_submit": True,
+        },
+    )
+    assert submit_result["ok"] is True
+
+    doc_events = await server.store.load_stream(f"docpkg-{app_id}")
+    assert sum(1 for event in doc_events if event.event_type == "DocumentAdded") == 2
+    assert sum(1 for event in doc_events if event.event_type == "ExtractionCompleted") == 2
+    assert sum(1 for event in doc_events if event.event_type == "QualityAssessmentCompleted") == 2
+    assert sum(1 for event in doc_events if event.event_type == "PackageReadyForAnalysis") == 1
+
+    extraction_paths = {
+        str(event.payload["document_path"])
+        for event in doc_events
+        if event.event_type == "ExtractionCompleted"
+    }
+    assert extraction_paths == {str(first_document), str(second_document)}
+
+    loan_events = await server.store.load_stream(f"loan-{app_id}")
+    assert sum(1 for event in loan_events if event.event_type == "CreditAnalysisRequested") == 1
+    assert sum(1 for event in loan_events if event.event_type == "FraudScreeningRequested") == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_application_can_process_documents_from_directory(
+    server: LedgerMCPServer,
+    tmp_path: Path,
+) -> None:
+    app_id = f"app-{uuid4()}"
+    documents_dir = tmp_path / "docs"
+    nested_dir = documents_dir / "nested"
+    nested_dir.mkdir(parents=True)
+
+    first_document = documents_dir / "application_financials_1.txt"
+    second_document = nested_dir / "application_financials_2.txt"
+    first_document.write_text(
+        (
+            "Total Revenue: 1250000\n"
+            "Net Income: 210000\n"
+            "EBITDA: 320000\n"
+            "Total Assets: 4500000\n"
+            "Total Liabilities: 1700000\n"
+        ),
+        encoding="utf-8",
+    )
+    second_document.write_text(
+        (
+            "Total Revenue: 980000\n"
+            "Net Income: 160000\n"
+            "EBITDA: 250000\n"
+            "Total Assets: 3900000\n"
+            "Total Liabilities: 1400000\n"
+        ),
+        encoding="utf-8",
+    )
+
+    submit_result = await server.call_tool(
+        "submit_application",
+        {
+            "application_id": app_id,
+            "applicant_id": "customer-xyz",
+            "requested_amount_usd": 12000,
+            "loan_purpose": "fleet purchase",
+            "submission_channel": "portal",
+            "submitted_at": datetime.now(UTC).isoformat(),
+            "document_paths": [str(documents_dir)],
+            "process_documents_after_submit": True,
+        },
+    )
+    assert submit_result["ok"] is True
+
+    doc_events = await server.store.load_stream(f"docpkg-{app_id}")
+    extraction_paths = {
+        str(event.payload["document_path"])
+        for event in doc_events
+        if event.event_type == "ExtractionCompleted"
+    }
+    assert extraction_paths == {str(first_document), str(second_document)}
 
 @pytest.mark.asyncio
 async def test_ledger_health_handles_null_confidence_event(server: LedgerMCPServer) -> None:

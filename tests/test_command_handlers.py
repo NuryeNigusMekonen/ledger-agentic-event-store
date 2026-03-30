@@ -285,6 +285,85 @@ async def test_submit_application_emits_document_and_analysis_request_events(
 
 
 @pytest.mark.asyncio
+async def test_submit_application_accepts_multiple_document_paths(tmp_path: Path) -> None:
+    application_id = "app-multi-docs"
+    first_document = tmp_path / "borrower_report_1.txt"
+    second_document = tmp_path / "borrower_report_2.txt"
+    first_document.write_text("Total Revenue: 1000000\nNet Income: 220000\n", encoding="utf-8")
+    second_document.write_text("Total Assets: 4500000\nTotal Liabilities: 1700000\n", encoding="utf-8")
+
+    store = RecordingStore(streams={})
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_submit_application(
+        SubmitApplicationCommand(
+            application_id=application_id,
+            applicant_id="customer-789",
+            requested_amount_usd=18000.0,
+            loan_purpose="inventory",
+            submission_channel="portal",
+            submitted_at=datetime.now(UTC),
+            document_paths=[str(first_document), str(second_document)],
+            process_documents_after_submit=False,
+        )
+    )
+
+    append_call = store.append_calls[0]
+    event_types = [event.event_type for event in append_call["events"]]
+    assert event_types == [
+        "ApplicationSubmitted",
+        "DocumentUploadRequested",
+        "DocumentUploaded",
+        "DocumentUploadRequested",
+        "DocumentUploaded",
+        "CreditAnalysisRequested",
+        "FraudScreeningRequested",
+    ]
+    assert result.new_stream_version == 7
+
+
+@pytest.mark.asyncio
+async def test_submit_application_expands_directory_document_path(tmp_path: Path) -> None:
+    application_id = "app-doc-directory"
+    documents_dir = tmp_path / "docs"
+    nested_dir = documents_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    first_document = documents_dir / "borrower_report_1.txt"
+    second_document = nested_dir / "borrower_report_2.txt"
+    first_document.write_text("Total Revenue: 1000000\nNet Income: 220000\n", encoding="utf-8")
+    second_document.write_text("Total Assets: 4500000\nTotal Liabilities: 1700000\n", encoding="utf-8")
+
+    store = RecordingStore(streams={})
+    handlers = WriteCommandHandlers(store=store)  # type: ignore[arg-type]
+
+    result = await handlers.handle_submit_application(
+        SubmitApplicationCommand(
+            application_id=application_id,
+            applicant_id="customer-789",
+            requested_amount_usd=18000.0,
+            loan_purpose="inventory",
+            submission_channel="portal",
+            submitted_at=datetime.now(UTC),
+            document_paths=[str(documents_dir)],
+            process_documents_after_submit=False,
+        )
+    )
+
+    append_call = store.append_calls[0]
+    upload_requested_paths = [
+        str(
+            event.payload["document_path"]
+            if isinstance(event.payload, dict)
+            else event.payload.document_path
+        )
+        for event in append_call["events"]
+        if event.event_type == "DocumentUploadRequested"
+    ]
+    assert set(upload_requested_paths) == {str(first_document), str(second_document)}
+    assert result.new_stream_version == 7
+
+
+@pytest.mark.asyncio
 async def test_start_agent_session_emits_started_and_recovery_events() -> None:
     agent_id = "credit-agent-2"
     session_id = "session-new"

@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import src.refinery.pipeline as pipeline_module
-from src.refinery.pipeline import DocumentRefineryPipeline, extract_financial_facts
+from src.refinery.pipeline import (
+    DocumentRefineryPipeline,
+    extract_financial_evidence,
+    extract_financial_facts,
+)
 
 
 def test_pipeline_extracts_financial_facts_and_builds_index(tmp_path: Path) -> None:
@@ -44,6 +48,21 @@ def test_pipeline_extracts_financial_facts_and_builds_index(tmp_path: Path) -> N
     )
     assert facts["total_revenue"] == 1250000.0
     assert facts["net_income"] == 210000.0
+
+    evidence = extract_financial_evidence(
+        doc,
+        rules_path=tmp_path / "rules.yaml",
+        sqlite_db_path=tmp_path / "facts3.db",
+        profiles_dir=tmp_path / "profiles3",
+        pageindex_dir=tmp_path / "pageindex3",
+        ledger_path=tmp_path / "ledger3.jsonl",
+    )
+    revenue_provenance = evidence.fact_provenance["total_revenue"]
+    assert revenue_provenance["page_number"] == 1
+    assert str(revenue_provenance["source_chunk_id"])
+    assert "Total Revenue" in str(revenue_provenance["source_excerpt"])
+    assert evidence.extraction_context["page_count"] == 1
+    assert evidence.extraction_context["domain_hint"] == "financial"
 
 
 def test_pipeline_llm_fallback_fills_missing_metrics(tmp_path: Path, monkeypatch) -> None:

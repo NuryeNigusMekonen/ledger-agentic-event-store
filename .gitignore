@@ -33,5 +33,6 @@ coverage/
 .vscode/
 .idea/
 .DS_Store
+.codex
 apps/web/tsconfig.app.tsbuildinfo
 apps/web/logo/

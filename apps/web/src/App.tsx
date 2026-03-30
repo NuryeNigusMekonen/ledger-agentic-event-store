@@ -106,6 +106,11 @@ type TimelinePhase = "Intake" | "Analysis" | "Compliance" | "Decision" | "Final 
 type EventTimeRange = "all" | "1h" | "24h" | "7d" | "30d";
 type AnalyticsWindowDays = 7 | 30 | 90;
 
+type EvidenceSection = {
+  label: string;
+  items: string[];
+};
+
 type LineageItem = {
   key: string;
   globalPosition: number;
@@ -119,6 +124,7 @@ type LineageItem = {
   streamId: string;
   correlationId: string | null;
   causationId: string | null;
+  evidenceSections: EvidenceSection[];
 };
 
 type ProjectionAssessment = {
@@ -233,6 +239,13 @@ function formatMoney(value: number | null | undefined): string {
   }).format(value);
 }
 
+function formatMoneyEvidence(value: number | null | undefined): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return formatMoney(value);
+}
+
 function shortId(value: string | null | undefined, edge = 6): string {
   if (!value) {
     return "Unavailable";
@@ -312,6 +325,463 @@ function readStringList(value: unknown): string[] {
     return [];
   }
   return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function formatEvidenceNumber(value: number | null | undefined, digits = 2): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value.toLocaleString(undefined, {
+    maximumFractionDigits: digits
+  });
+}
+
+function appendEvidenceItem(items: string[], label: string, value: string | null | undefined): void {
+  if (!value) {
+    return;
+  }
+  items.push(`${label}: ${value}`);
+}
+
+function evidenceFactsSection(payload: Record<string, unknown>): EvidenceSection | null {
+  const facts = readRecord(payload.facts);
+  const items: string[] = [];
+  appendEvidenceItem(items, "Revenue", formatEvidenceNumber(readNumber(facts.total_revenue)));
+  appendEvidenceItem(items, "Net income", formatEvidenceNumber(readNumber(facts.net_income)));
+  appendEvidenceItem(items, "EBITDA", formatEvidenceNumber(readNumber(facts.ebitda)));
+  appendEvidenceItem(items, "Assets", formatEvidenceNumber(readNumber(facts.total_assets)));
+  appendEvidenceItem(items, "Liabilities", formatEvidenceNumber(readNumber(facts.total_liabilities)));
+  return items.length > 0 ? { label: "Extracted facts", items } : null;
+}
+
+function evidenceQualitySection(payload: Record<string, unknown>): EvidenceSection | null {
+  const items: string[] = [];
+  const confidence = readNumber(payload.overall_confidence);
+  appendEvidenceItem(
+    items,
+    "Overall confidence",
+    confidence === null ? null : formatPercent(confidence * 100, 1)
+  );
+  appendEvidenceItem(
+    items,
+    "Coherence",
+    readBoolean(payload.is_coherent) === null
+      ? null
+      : readBoolean(payload.is_coherent)
+        ? "Coherent"
+        : "Needs review"
+  );
+  appendEvidenceItem(
+    items,
+    "Re-extraction",
+    readBoolean(payload.reextraction_recommended) === null
+      ? null
+      : readBoolean(payload.reextraction_recommended)
+        ? "Recommended"
+        : "Not required"
+  );
+  const missingFields = readStringList(payload.critical_missing_fields);
+  if (missingFields.length > 0) {
+    items.push(`Missing fields: ${missingFields.map((field) => titleize(field)).join(", ")}`);
+  }
+  const anomalies = readStringList(payload.anomalies);
+  if (anomalies.length > 0) {
+    items.push(`Anomalies: ${anomalies.map((entry) => titleize(entry)).join(", ")}`);
+  }
+  return items.length > 0 ? { label: "Quality checks", items } : null;
+}
+
+function buildEvidenceSections(
+  eventType: string,
+  payload: Record<string, unknown>,
+  metadata: Record<string, unknown>
+): EvidenceSection[] {
+  const sections: EvidenceSection[] = [];
+  const documentSourceItems: string[] = [];
+
+  if (eventType === "DocumentUploadRequested" || eventType === "DocumentUploaded") {
+    appendEvidenceItem(documentSourceItems, "Document path", readString(payload.document_path));
+  }
+  if (eventType === "DocumentAdded" || eventType === "DocumentFormatValidated") {
+    appendEvidenceItem(documentSourceItems, "Document path", readString(payload.document_path));
+    appendEvidenceItem(documentSourceItems, "Document type", readString(payload.document_type));
+    appendEvidenceItem(documentSourceItems, "Format", readString(payload.format));
+    appendEvidenceItem(
+      documentSourceItems,
+      "Supported",
+      readBoolean(payload.is_supported) === null
+        ? null
+        : readBoolean(payload.is_supported)
+          ? "Yes"
+          : "No"
+    );
+  }
+  if (eventType === "ExtractionStarted") {
+    appendEvidenceItem(documentSourceItems, "Document path", readString(payload.document_path));
+    appendEvidenceItem(documentSourceItems, "Pipeline", readString(payload.pipeline));
+  }
+  if (documentSourceItems.length > 0) {
+    sections.push({ label: "Document source", items: documentSourceItems });
+  }
+
+  if (eventType === "ExtractionCompleted") {
+    const factsSection = evidenceFactsSection(payload);
+    if (factsSection) {
+      sections.push(factsSection);
+    }
+    const extractionContext = readRecord(payload.extraction_context);
+    const contextItems: string[] = [];
+    appendEvidenceItem(contextItems, "Strategy", readString(extractionContext.strategy_used));
+    appendEvidenceItem(
+      contextItems,
+      "Extraction confidence",
+      readNumber(extractionContext.extraction_confidence) === null
+        ? null
+        : formatPercent((readNumber(extractionContext.extraction_confidence) ?? 0) * 100, 1)
+    );
+    appendEvidenceItem(
+      contextItems,
+      "Pages",
+      readNumber(extractionContext.page_count) === null
+        ? null
+        : formatCount(readNumber(extractionContext.page_count))
+    );
+    appendEvidenceItem(contextItems, "Domain hint", titleize(readString(extractionContext.domain_hint)));
+    appendEvidenceItem(contextItems, "Origin", titleize(readString(extractionContext.origin_type)));
+    appendEvidenceItem(contextItems, "Layout", titleize(readString(extractionContext.layout_complexity)));
+    if (contextItems.length > 0) {
+      sections.push({ label: "Extraction context", items: contextItems });
+    }
+    const confidenceMap = readRecord(payload.field_confidence);
+    const confidenceItems: string[] = [];
+    for (const [field, value] of Object.entries(confidenceMap)) {
+      const numericValue = readNumber(value);
+      if (numericValue === null) {
+        continue;
+      }
+      confidenceItems.push(`${titleize(field)}: ${formatPercent(numericValue * 100, 0)}`);
+    }
+    if (confidenceItems.length > 0) {
+      sections.push({ label: "Field coverage", items: confidenceItems });
+    }
+    const extractionNotes = readStringList(payload.extraction_notes);
+    if (extractionNotes.length > 0) {
+      sections.push({
+        label: "Extraction notes",
+        items: extractionNotes.map((entry) => titleize(entry))
+      });
+    }
+    const factProvenance = readRecord(payload.fact_provenance);
+    const provenanceItems = Object.entries(factProvenance)
+      .map(([metric, raw]) => {
+        const provenance = readRecord(raw);
+        const parts = [
+          titleize(metric),
+          readString(provenance.raw_value) ? `raw ${String(provenance.raw_value)}` : null,
+          readNumber(provenance.page_number) !== null
+            ? `page ${formatCount(readNumber(provenance.page_number))}`
+            : null,
+          readString(provenance.source_chunk_id)
+            ? `chunk ${shortId(readString(provenance.source_chunk_id), 10)}`
+            : null
+        ].filter((value): value is string => Boolean(value));
+        return parts.join(" • ");
+      })
+      .filter(Boolean);
+    if (provenanceItems.length > 0) {
+      sections.push({ label: "Fact provenance", items: provenanceItems });
+    }
+    const excerptItems = Object.entries(factProvenance)
+      .map(([metric, raw]) => {
+        const provenance = readRecord(raw);
+        const excerpt = readString(provenance.source_excerpt);
+        if (!excerpt) {
+          return null;
+        }
+        return `${titleize(metric)} excerpt: ${excerpt}`;
+      })
+      .filter((value): value is string => Boolean(value));
+    if (excerptItems.length > 0) {
+      sections.push({ label: "Source excerpts", items: excerptItems });
+    }
+  }
+
+  if (eventType === "QualityAssessmentCompleted") {
+    const qualitySection = evidenceQualitySection(payload);
+    if (qualitySection) {
+      sections.push(qualitySection);
+    }
+    const notes = readString(payload.auditor_notes);
+    if (notes) {
+      sections.push({ label: "Assessment notes", items: [`Auditor notes: ${notes}`] });
+    }
+  }
+
+  if (eventType === "PackageCreated" || eventType === "PackageReadyForAnalysis") {
+    const packageItems: string[] = [];
+    appendEvidenceItem(packageItems, "Package ID", readString(payload.package_id));
+    appendEvidenceItem(packageItems, "Ready at", readString(payload.ready_at));
+    appendEvidenceItem(packageItems, "Created at", readString(payload.created_at));
+    if (packageItems.length > 0) {
+      sections.push({ label: "Package status", items: packageItems });
+    }
+  }
+
+  if (eventType === "CreditAnalysisRequested" || eventType === "FraudScreeningRequested") {
+    const requestItems: string[] = [];
+    appendEvidenceItem(requestItems, "Assigned agent", readString(payload.assigned_agent_id));
+    appendEvidenceItem(requestItems, "Priority", readString(payload.priority));
+    appendEvidenceItem(requestItems, "Source", readString(payload.source));
+    appendEvidenceItem(requestItems, "Document package stream", readString(payload.docpkg_stream_id));
+    if (requestItems.length > 0) {
+      sections.push({ label: "Request context", items: requestItems });
+    }
+  }
+
+  if (eventType === "CreditAnalysisCompleted") {
+    const analysisItems: string[] = [];
+    appendEvidenceItem(analysisItems, "Risk tier", readString(payload.risk_tier));
+    appendEvidenceItem(
+      analysisItems,
+      "Confidence",
+      readNumber(payload.confidence_score) === null
+        ? null
+        : formatPercent((readNumber(payload.confidence_score) ?? 0) * 100, 1)
+    );
+    appendEvidenceItem(
+      analysisItems,
+      "Recommended limit",
+      formatMoneyEvidence(readNumber(payload.recommended_limit_usd))
+    );
+    appendEvidenceItem(analysisItems, "Model", readString(payload.model_version));
+    appendEvidenceItem(
+      analysisItems,
+      "Duration",
+      readNumber(payload.analysis_duration_ms) === null
+        ? null
+        : `${formatCount(readNumber(payload.analysis_duration_ms))} ms`
+    );
+    appendEvidenceItem(analysisItems, "Input hash", shortId(readString(payload.input_data_hash), 8));
+    if (analysisItems.length > 0) {
+      sections.push({ label: "Risk evidence", items: analysisItems });
+    }
+  }
+
+  if (eventType === "FraudScreeningCompleted") {
+    const fraudItems: string[] = [];
+    appendEvidenceItem(
+      fraudItems,
+      "Fraud score",
+      readNumber(payload.fraud_score) === null ? null : formatEvidenceNumber(readNumber(payload.fraud_score), 2)
+    );
+    appendEvidenceItem(fraudItems, "Screening model", readString(payload.screening_model_version));
+    appendEvidenceItem(fraudItems, "Input hash", shortId(readString(payload.input_data_hash), 8));
+    const anomalyFlags = readStringList(payload.anomaly_flags);
+    fraudItems.push(
+      anomalyFlags.length > 0
+        ? `Anomaly flags: ${anomalyFlags.map((entry) => titleize(entry)).join(", ")}`
+        : "Anomaly flags: None"
+    );
+    sections.push({ label: "Fraud evidence", items: fraudItems });
+  }
+
+  if (eventType === "ComplianceCheckRequested") {
+    const complianceItems: string[] = [];
+    appendEvidenceItem(complianceItems, "Regulation set", readString(payload.regulation_set_version));
+    const checksRequired = readStringList(payload.checks_required);
+    if (checksRequired.length > 0) {
+      complianceItems.push(`Checks required: ${checksRequired.map((entry) => titleize(entry)).join(", ")}`);
+    }
+    if (complianceItems.length > 0) {
+      sections.push({ label: "Compliance scope", items: complianceItems });
+    }
+  }
+
+  if (eventType === "ComplianceRulePassed" || eventType === "ComplianceRuleFailed") {
+    const ruleItems: string[] = [];
+    appendEvidenceItem(ruleItems, "Rule ID", readString(payload.rule_id));
+    appendEvidenceItem(ruleItems, "Rule version", readString(payload.rule_version));
+    appendEvidenceItem(ruleItems, "Failure reason", readString(payload.failure_reason));
+    appendEvidenceItem(ruleItems, "Evidence hash", shortId(readString(payload.evidence_hash), 8));
+    appendEvidenceItem(
+      ruleItems,
+      "Remediation required",
+      readBoolean(payload.remediation_required) === null
+        ? null
+        : readBoolean(payload.remediation_required)
+          ? "Yes"
+          : "No"
+    );
+    if (ruleItems.length > 0) {
+      sections.push({ label: "Rule evidence", items: ruleItems });
+    }
+  }
+
+  if (eventType === "ComplianceCheckCompleted") {
+    const verdictItems: string[] = [];
+    appendEvidenceItem(verdictItems, "Overall verdict", titleize(readString(payload.overall_verdict)));
+    appendEvidenceItem(
+      verdictItems,
+      "Completed checks",
+      readNumber(payload.completed_checks) === null ? null : formatCount(readNumber(payload.completed_checks))
+    );
+    appendEvidenceItem(
+      verdictItems,
+      "Total checks",
+      readNumber(payload.total_checks) === null ? null : formatCount(readNumber(payload.total_checks))
+    );
+    const failedRules = readStringList(payload.failed_rule_ids);
+    verdictItems.push(
+      failedRules.length > 0
+        ? `Failed rules: ${failedRules.map((entry) => titleize(entry)).join(", ")}`
+        : "Failed rules: None"
+    );
+    sections.push({ label: "Compliance verdict", items: verdictItems });
+  }
+
+  if (eventType === "DecisionRequested") {
+    const requestItems: string[] = [];
+    const requiredInputs = readStringList(payload.required_inputs);
+    if (requiredInputs.length > 0) {
+      requestItems.push(`Required inputs: ${requiredInputs.map((entry) => titleize(entry)).join(", ")}`);
+    }
+    appendEvidenceItem(requestItems, "Requested by", readString(payload.requested_by));
+    if (requestItems.length > 0) {
+      sections.push({ label: "Decision request", items: requestItems });
+    }
+  }
+
+  if (eventType === "DecisionGenerated") {
+    const recommendationItems: string[] = [];
+    appendEvidenceItem(recommendationItems, "Recommendation", titleize(readString(payload.recommendation)));
+    appendEvidenceItem(
+      recommendationItems,
+      "Confidence",
+      readNumber(payload.confidence_score) === null
+        ? null
+        : formatPercent((readNumber(payload.confidence_score) ?? 0) * 100, 1)
+    );
+    appendEvidenceItem(
+      recommendationItems,
+      "Assessed max limit",
+      formatMoneyEvidence(readNumber(payload.assessed_max_limit_usd))
+    );
+    appendEvidenceItem(recommendationItems, "Compliance status", titleize(readString(payload.compliance_status)));
+    if (recommendationItems.length > 0) {
+      sections.push({ label: "Recommendation evidence", items: recommendationItems });
+    }
+
+    const basisItems: string[] = [];
+    appendEvidenceItem(basisItems, "Decision basis", readString(payload.decision_basis_summary));
+    const sessions = readStringList(payload.contributing_agent_sessions);
+    if (sessions.length > 0) {
+      basisItems.push(`Contributing sessions: ${sessions.map((session) => shortId(session, 10)).join(", ")}`);
+    }
+    const modelVersions = readRecord(payload.model_versions);
+    const modelEntries = Object.entries(modelVersions)
+      .filter(([, version]) => readString(version))
+      .map(([actor, version]) => `${actor}: ${String(version)}`);
+    if (modelEntries.length > 0) {
+      basisItems.push(`Model versions: ${modelEntries.join(", ")}`);
+    }
+    if (basisItems.length > 0) {
+      sections.push({ label: "Decision basis", items: basisItems });
+    }
+  }
+
+  if (eventType === "HumanReviewCompleted") {
+    const reviewItems: string[] = [];
+    appendEvidenceItem(reviewItems, "Final decision", titleize(readString(payload.final_decision)));
+    appendEvidenceItem(
+      reviewItems,
+      "Override",
+      readBoolean(payload.override) === null ? null : readBoolean(payload.override) ? "Yes" : "No"
+    );
+    appendEvidenceItem(reviewItems, "Override reason", readString(payload.override_reason));
+    if (reviewItems.length > 0) {
+      sections.push({ label: "Human review", items: reviewItems });
+    }
+  }
+
+  if (eventType === "ApplicationApproved") {
+    const approvalItems: string[] = [];
+    appendEvidenceItem(
+      approvalItems,
+      "Approved amount",
+      formatMoneyEvidence(readNumber(payload.approved_amount_usd))
+    );
+    appendEvidenceItem(
+      approvalItems,
+      "Interest rate",
+      readNumber(payload.interest_rate) === null ? null : `${formatEvidenceNumber(readNumber(payload.interest_rate), 2)}%`
+    );
+    appendEvidenceItem(approvalItems, "Effective date", readString(payload.effective_date));
+    const conditions = readStringList(payload.conditions);
+    if (conditions.length > 0) {
+      approvalItems.push(`Conditions: ${conditions.join(", ")}`);
+    }
+    if (approvalItems.length > 0) {
+      sections.push({ label: "Final approval", items: approvalItems });
+    }
+  }
+
+  if (eventType === "ApplicationDeclined") {
+    const declineItems: string[] = [];
+    const reasons = readStringList(payload.decline_reasons);
+    if (reasons.length > 0) {
+      declineItems.push(`Decline reasons: ${reasons.join(", ")}`);
+    }
+    appendEvidenceItem(
+      declineItems,
+      "Adverse notice required",
+      readBoolean(payload.adverse_action_notice_required) === null
+        ? null
+        : readBoolean(payload.adverse_action_notice_required)
+          ? "Yes"
+          : "No"
+    );
+    if (declineItems.length > 0) {
+      sections.push({ label: "Final decline", items: declineItems });
+    }
+  }
+
+  if (eventType === "AuditIntegrityCheckRun") {
+    const integrityItems: string[] = [];
+    appendEvidenceItem(
+      integrityItems,
+      "Events verified",
+      readNumber(payload.events_verified_count) === null ? null : formatCount(readNumber(payload.events_verified_count))
+    );
+    appendEvidenceItem(integrityItems, "Integrity hash", shortId(readString(payload.integrity_hash), 8));
+    appendEvidenceItem(integrityItems, "Previous hash", shortId(readString(payload.previous_hash), 8));
+    appendEvidenceItem(
+      integrityItems,
+      "Chain valid",
+      readBoolean(payload.chain_valid) === null ? null : readBoolean(payload.chain_valid) ? "Yes" : "No"
+    );
+    appendEvidenceItem(
+      integrityItems,
+      "Tamper detected",
+      readBoolean(payload.tamper_detected) === null ? null : readBoolean(payload.tamper_detected) ? "Yes" : "No"
+    );
+    if (integrityItems.length > 0) {
+      sections.push({ label: "Integrity attestation", items: integrityItems });
+    }
+  }
+
+  const lineageItems: string[] = [];
+  appendEvidenceItem(lineageItems, "Correlation ID", shortId(readString(metadata.correlation_id), 8));
+  appendEvidenceItem(lineageItems, "Causation ID", shortId(readString(metadata.causation_id), 8));
+  appendEvidenceItem(lineageItems, "Actor", readString(metadata.actor_id));
+  if (lineageItems.length > 0) {
+    sections.push({ label: "Event lineage", items: lineageItems });
+  }
+
+  return sections;
 }
 
 function toDateTimeLocalValue(value: string): string {
@@ -426,6 +896,28 @@ function conciseDescription(value: string | null | undefined): string {
   return firstSentence.endsWith(".") ? firstSentence : `${firstSentence}.`;
 }
 
+function commandPayloadHint(toolName: string): string {
+  const hints: Record<string, string> = {
+    submit_application:
+      "Change application_id and submitted_at each run. If document processing is enabled, set document_path or document_paths to real files.",
+    start_agent_session:
+      "Change agent_id + session_id (use a new pair per run). Keep model_version aligned with later analysis commands.",
+    record_credit_analysis:
+      "Change application_id, agent_id, session_id, model_version, and input_data_hash. Session must already be started.",
+    record_fraud_screening:
+      "Change application_id, agent_id, session_id, screening_model_version, and input_data_hash. Use the same model/session as session start.",
+    record_compliance_check:
+      "Change application_id and rule_id. First compliance call for an app must include checks_required containing that rule.",
+    generate_decision:
+      "Change application_id and contributing_agent_sessions (format: agent-<agent_id>-<session_id>) to match your completed analyses.",
+    record_human_review:
+      "Change application_id. For APPROVE include approved_amount_usd; if override=true you must provide override_reason.",
+    run_integrity_check:
+      "Change entity_id to your application ID. role must be compliance/admin, and checks are limited to once per minute per app."
+  };
+  return hints[toolName] ?? "Update identifiers (application/session/agent IDs) to match your current run context.";
+}
+
 function normalizeAuditAction(value: string): string {
   return value
     .replace(/^command:/i, "")
@@ -518,23 +1010,129 @@ function isAuthFailure(error: unknown): boolean {
   return error instanceof LedgerApiError && (error.status === 401 || error.status === 403);
 }
 
-function commandSeed(toolName: string, applicationId: string, role: string | undefined): Record<string, unknown> {
-  const seeded = DEFAULT_COMMAND_PAYLOAD[toolName];
-  if (seeded) {
-    const patched = { ...seeded };
-    if (toolName === "run_integrity_check") {
-      patched.entity_id = applicationId || String(patched.entity_id);
-      patched.role = role ?? patched.role;
-    }
-    if ("application_id" in patched) {
-      patched.application_id = applicationId || String(patched.application_id);
-    }
-    return patched;
+function commandSeed(
+  toolName: string,
+  applicationId: string,
+  role: string | undefined,
+  currentAgentId: string
+): Record<string, unknown> {
+  const targetApplicationId = applicationId.trim() || "app-addis-001";
+  const targetAgentId = currentAgentId.trim() || "credit-agent-ethi-01";
+  const appToken =
+    targetApplicationId
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase() || "app-addis-001";
+  const sessionId = `sess-${appToken}-01`;
+  const sessionStreamId = `agent-${targetAgentId}-${sessionId}`;
+  const modelVersion = "credit-v2";
+  const normalizedRole = (role ?? "").toLowerCase();
+  const integrityRole =
+    normalizedRole === "admin" || normalizedRole === "compliance"
+      ? normalizedRole
+      : "compliance";
+
+  if (toolName === "submit_application") {
+    return {
+      application_id: targetApplicationId,
+      applicant_id: "et-borrower-001",
+      requested_amount_usd: 1250000,
+      loan_purpose: "working_capital",
+      submission_channel: "addis-branch",
+      submitted_at: new Date().toISOString(),
+      process_documents_after_submit: false
+    };
   }
 
-  return {
-    application_id: applicationId || "app-addis-001"
-  };
+  if (toolName === "start_agent_session") {
+    return {
+      agent_id: targetAgentId,
+      session_id: sessionId,
+      context_source: `loan_application:${targetApplicationId}`,
+      event_replay_from_position: 0,
+      context_token_count: 256,
+      model_version: modelVersion
+    };
+  }
+
+  if (toolName === "record_credit_analysis") {
+    return {
+      application_id: targetApplicationId,
+      agent_id: targetAgentId,
+      session_id: sessionId,
+      model_version: modelVersion,
+      confidence_score: 0.87,
+      risk_tier: "MEDIUM",
+      recommended_limit_usd: 1100000,
+      analysis_duration_ms: 142,
+      input_data_hash: `hash-credit-${appToken}`
+    };
+  }
+
+  if (toolName === "record_fraud_screening") {
+    return {
+      application_id: targetApplicationId,
+      agent_id: targetAgentId,
+      session_id: sessionId,
+      fraud_score: 0.08,
+      anomaly_flags: [],
+      screening_model_version: modelVersion,
+      input_data_hash: `hash-fraud-${appToken}`
+    };
+  }
+
+  if (toolName === "record_compliance_check") {
+    return {
+      application_id: targetApplicationId,
+      regulation_set_version: "2026.03",
+      rule_id: "rule-a",
+      rule_version: "v1",
+      passed: true,
+      checks_required: ["rule-a"]
+    };
+  }
+
+  if (toolName === "generate_decision") {
+    return {
+      application_id: targetApplicationId,
+      orchestrator_agent_id: "orchestrator-1",
+      recommendation: "APPROVE",
+      confidence_score: 0.91,
+      decision_basis_summary: "credit/fraud/compliance acceptable",
+      contributing_agent_sessions: [sessionStreamId],
+      model_versions: {
+        [targetAgentId]: modelVersion,
+        "orchestrator-1": "orch-v1"
+      }
+    };
+  }
+
+  if (toolName === "record_human_review") {
+    return {
+      application_id: targetApplicationId,
+      reviewer_id: "loan-officer-addis-01",
+      override: false,
+      final_decision: "APPROVE",
+      approved_amount_usd: 1000000,
+      interest_rate: 7.2,
+      conditions: ["signed guarantee"],
+      effective_date: "2026-03-29"
+    };
+  }
+
+  if (toolName === "run_integrity_check") {
+    return {
+      entity_type: "application",
+      entity_id: targetApplicationId,
+      role: integrityRole
+    };
+  }
+
+  const seeded = DEFAULT_COMMAND_PAYLOAD[toolName];
+  if (seeded) {
+    return { ...seeded };
+  }
+  return { application_id: targetApplicationId };
 }
 
 function eventMatchesApplication(event: RecentEvent, applicationId: string): boolean {
@@ -748,7 +1346,8 @@ function buildLineageItemFromRecent(event: RecentEvent): LineageItem {
     ),
     streamId: event.stream_id,
     correlationId: readString(metadata.correlation_id),
-    causationId: readString(metadata.causation_id)
+    causationId: readString(metadata.causation_id),
+    evidenceSections: buildEvidenceSections(event.event_type, payload, metadata)
   };
 }
 
@@ -772,7 +1371,8 @@ function buildLineageItemFromCompliance(entry: ComplianceTimelineEvent): Lineage
     tone: toTone(entry.compliance_status),
     streamId: "compliance projection",
     correlationId: null,
-    causationId: null
+    causationId: null,
+    evidenceSections: buildEvidenceSections(entry.event_type, payload, {})
   };
 }
 
@@ -1144,7 +1744,7 @@ function DeliveryHealthPanel(props: { delivery: DeliveryHealth | null }): ReactN
         <article className="operations-health-card">
           <span>Total published</span>
           <strong>{formatCount(delivery.outbox.published_total)}</strong>
-          <small>{`${formatCount(delivery.throughput.published_last_5m)} in last 5m`}</small>
+          <small>{`${formatCount(delivery.throughput.published_last_1h)} in last 1h`}</small>
         </article>
       </div>
 
@@ -1560,6 +2160,7 @@ function CommandCenterPanel(props: {
           </div>
 
           <p className="field-note">{conciseDescription(props.selectedToolDefinition?.description)}</p>
+          <p className="field-note">{commandPayloadHint(props.selectedTool)}</p>
           <details className="detail-inline">
             <summary>Command guidance</summary>
             <p className="field-note">
@@ -1718,6 +2319,18 @@ function AuditPhaseTimeline(props: {
                             <span>{item.checkpoint}</span>
                           </div>
                           <p className="lineage-summary">{item.summary}</p>
+                          {props.showMetadata && item.evidenceSections.length > 0 ? (
+                            item.evidenceSections.map((section) => (
+                              <div className="evidence-inline" key={`${item.key}-${section.label}`}>
+                                <span className="meta-label">{section.label}</span>
+                                <div className="lineage-evidence">
+                                  {section.items.map((evidenceItem) => (
+                                    <span key={evidenceItem}>{evidenceItem}</span>
+                                  ))}
+                                </div>
+                              </div>
+                            ))
+                          ) : null}
                           {props.showMetadata ? (
                             <div className="evidence-inline">
                               <span className="meta-label">Event metadata</span>
@@ -1875,7 +2488,7 @@ export default function App() {
   const [toolDefinitions, setToolDefinitions] = useState<ToolDefinition[]>([]);
   const [selectedTool, setSelectedTool] = useState<string>("submit_application");
   const [commandPayload, setCommandPayload] = useState<string>(
-    JSON.stringify(DEFAULT_COMMAND_PAYLOAD.submit_application, null, 2)
+    JSON.stringify(commandSeed("submit_application", "", undefined, "credit-agent-ethi-01"), null, 2)
   );
   const [commandResult, setCommandResult] = useState<string>("");
 
@@ -2082,8 +2695,13 @@ export default function App() {
     const complianceRows = (compliance?.timeline ?? []).map(buildLineageItemFromCompliance);
     const deduped = new Map<string, LineageItem>();
 
-    [...rows, ...complianceRows].forEach((item) => {
+    rows.forEach((item) => {
       deduped.set(item.key, item);
+    });
+    complianceRows.forEach((item) => {
+      if (!deduped.has(item.key)) {
+        deduped.set(item.key, item);
+      }
     });
 
     return Array.from(deduped.values()).sort((left, right) => left.globalPosition - right.globalPosition);
@@ -2449,7 +3067,7 @@ export default function App() {
     if (nextTools.length > 0 && !nextTools.some((item) => item.name === selectedTool)) {
       const nextTool = nextTools[0].name;
       setSelectedTool(nextTool);
-      setCommandPayload(JSON.stringify(commandSeed(nextTool, applicationId, authUser?.role), null, 2));
+      setCommandPayload(JSON.stringify(commandSeed(nextTool, applicationId, authUser?.role, agentId), null, 2));
     }
 
     if (canViewAudit) {
@@ -2460,7 +3078,7 @@ export default function App() {
     }
 
     setLastRefresh(new Date().toISOString());
-  }, [analyticsWindow, applicationId, authUser?.role, canViewAudit, selectedTool]);
+  }, [agentId, analyticsWindow, applicationId, authUser?.role, canViewAudit, selectedTool]);
 
   const loadEverything = useCallback(async () => {
     if (!authUser) {
@@ -2578,7 +3196,7 @@ export default function App() {
       });
       setNotice(`Apex session established for ${session.user.username}.`);
       setCommandPayload(
-        JSON.stringify(commandSeed(selectedTool, applicationId, session.user.role), null, 2)
+        JSON.stringify(commandSeed(selectedTool, applicationId, session.user.role, agentId), null, 2)
       );
     } catch (error) {
       if (error instanceof LedgerApiError) {
@@ -2781,12 +3399,12 @@ export default function App() {
 
   function handleToolChange(nextTool: string) {
     setSelectedTool(nextTool);
-    setCommandPayload(JSON.stringify(commandSeed(nextTool, applicationId, authUser?.role), null, 2));
+    setCommandPayload(JSON.stringify(commandSeed(nextTool, applicationId, authUser?.role, agentId), null, 2));
     setCommandResult("");
   }
 
   function prepareTool(toolName: string, overrides?: Record<string, unknown>) {
-    const nextPayload = { ...commandSeed(toolName, applicationId, authUser?.role), ...overrides };
+    const nextPayload = { ...commandSeed(toolName, applicationId, authUser?.role, agentId), ...overrides };
     setSelectedTool(toolName);
     setCommandPayload(JSON.stringify(nextPayload, null, 2));
     setCommandResult("");

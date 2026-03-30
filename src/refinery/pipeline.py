@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from src.refinery.chunker import ChunkingEngine
 from src.refinery.facts import (
@@ -24,6 +25,13 @@ class PipelineResult:
     chunks: list[LDU]
     page_index: PageIndex
     facts_count: int
+
+
+@dataclass(slots=True)
+class FinancialEvidenceResult:
+    facts: dict[str, float | None]
+    fact_provenance: dict[str, dict[str, Any]]
+    extraction_context: dict[str, Any]
 
 
 class DocumentRefineryPipeline:
@@ -151,6 +159,34 @@ def extract_financial_facts(
 
     Returns high-value financial facts when present. Missing values remain None.
     """
+    evidence = extract_financial_evidence(
+        document_path,
+        rules_path=rules_path,
+        sqlite_db_path=sqlite_db_path,
+        profiles_dir=profiles_dir,
+        pageindex_dir=pageindex_dir,
+        ledger_path=ledger_path,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+    )
+    return evidence.facts
+
+
+def extract_financial_evidence(
+    document_path: str | Path,
+    *,
+    rules_path: str | Path = "rubric/extraction_rules.yaml",
+    sqlite_db_path: str | Path = ".refinery/facts.db",
+    profiles_dir: str | Path = ".refinery/profiles",
+    pageindex_dir: str | Path = ".refinery/pageindex",
+    ledger_path: str | Path = ".refinery/extraction_ledger.jsonl",
+    gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
+    openai_api_key: str | None = None,
+    openai_model: str | None = None,
+) -> FinancialEvidenceResult:
     pipeline = DocumentRefineryPipeline(
         rules_path=rules_path,
         sqlite_db_path=sqlite_db_path,
@@ -165,15 +201,52 @@ def extract_financial_facts(
     result = pipeline.run(document_path)
 
     rows = pipeline.fact_store.query(
-        "SELECT metric_name, metric_value FROM fact_table "
+        "SELECT metric_name, metric_value, raw_value, currency, source_chunk_id, page_number "
+        "FROM fact_table "
         f"WHERE document_id='{result.profile.document_id}'"
     )
     lookup = {str(row["metric_name"]): float(row["metric_value"]) for row in rows}
+    chunk_lookup = {chunk.chunk_id: chunk for chunk in result.chunks}
+    fact_provenance: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        metric_name = str(row["metric_name"])
+        source_chunk_id = str(row["source_chunk_id"])
+        source_chunk = chunk_lookup.get(source_chunk_id)
+        if source_chunk is None and ":" in source_chunk_id:
+            source_chunk = chunk_lookup.get(source_chunk_id.split(":", 1)[1])
 
-    return {
+        excerpt: str | None = None
+        if source_chunk is not None:
+            compact = " ".join(source_chunk.content.split())
+            excerpt = compact[:180] + "..." if len(compact) > 180 else compact
+
+        fact_provenance[metric_name] = {
+            "raw_value": str(row["raw_value"]),
+            "currency": str(row["currency"]),
+            "page_number": int(row["page_number"]),
+            "source_chunk_id": source_chunk_id,
+            "source_excerpt": excerpt,
+        }
+
+    facts = {
         "total_revenue": lookup.get("total_revenue"),
         "net_income": lookup.get("net_income"),
         "ebitda": lookup.get("ebitda"),
         "total_assets": lookup.get("total_assets"),
         "total_liabilities": lookup.get("total_liabilities"),
     }
+    extraction_context = {
+        "document_id": result.profile.document_id,
+        "document_name": result.profile.document_name,
+        "strategy_used": result.extracted.strategy_used,
+        "extraction_confidence": round(result.extracted.confidence_score, 3),
+        "page_count": result.profile.page_count,
+        "domain_hint": result.profile.domain_hint,
+        "origin_type": result.profile.origin_type,
+        "layout_complexity": result.profile.layout_complexity,
+    }
+    return FinancialEvidenceResult(
+        facts=facts,
+        fact_provenance=fact_provenance,
+        extraction_context=extraction_context,
+    )

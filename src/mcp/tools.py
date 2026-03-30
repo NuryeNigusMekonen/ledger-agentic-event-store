@@ -32,6 +32,7 @@ class SubmitApplicationInput(BaseModel):
     submission_channel: str
     submitted_at: datetime
     document_path: str | None = None
+    document_paths: list[str] = Field(default_factory=list)
     process_documents_after_submit: bool = False
     correlation_id: str | None = None
     causation_id: str | None = None
@@ -155,8 +156,9 @@ class LedgerMCPTools:
                 "description": (
                     "Create ApplicationSubmitted. Preconditions: application_id must be unique; "
                     "requested_amount_usd must be > 0; if process_documents_after_submit=true, "
-                    "document_path must point to an existing readable file. "
-                    "Action when blocked: choose a new application_id or fix document_path."
+                    "document_path or document_paths must point to existing readable files (or "
+                    "directories containing files). "
+                    "Action when blocked: choose a new application_id or fix document_path(s)."
                 ),
                 "input_schema": SubmitApplicationInput.model_json_schema(),
             },
@@ -310,6 +312,7 @@ class LedgerMCPTools:
                 submission_channel=params.submission_channel,
                 submitted_at=params.submitted_at,
                 document_path=params.document_path,
+                document_paths=params.document_paths,
                 process_documents_after_submit=params.process_documents_after_submit,
                 correlation_id=params.correlation_id,
                 causation_id=params.causation_id,

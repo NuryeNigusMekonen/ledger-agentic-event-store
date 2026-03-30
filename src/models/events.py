@@ -119,6 +119,8 @@ class ExtractionCompletedPayload(BaseModel):
     application_id: str
     document_path: str
     facts: dict[str, Any]
+    fact_provenance: dict[str, Any] = Field(default_factory=dict)
+    extraction_context: dict[str, Any] = Field(default_factory=dict)
     field_confidence: dict[str, float]
     extraction_notes: list[str] = Field(default_factory=list)
     completed_at: str
